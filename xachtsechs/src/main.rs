@@ -497,6 +497,15 @@ enum Inst {
 	//OverrideNextDefaultSegment(Reg)
 }
 
+enum InterruptResult {
+	Return,
+	Stop,
+}
+
+trait EventHandler {
+	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult;
+}
+
 struct Machine8086 {
 	memory: Vec<u8>,
 	registers: [u16; REG_COUNT],
@@ -520,6 +529,15 @@ impl Machine8086 {
 		machine.set_flag(Flag::Interrupt, true);
 		// This bit is set by default in ZETA for some reason.
 		machine.registers[Reg::Flags as usize] |= 0b10;
+		
+		// Configure the interrupt table.
+		for i in 0..256u16 {
+			let addr = (i << 2) as u32;
+			// The IP to jump to.
+			machine.poke_u16(addr, 0x1100 + i);
+			// The CS the IP is within.
+			machine.poke_u16(addr + 2, 0xf000);
+		}
 		
 		machine
 	}
@@ -730,14 +748,14 @@ impl Machine8086 {
 	}
 	
 	fn push_u16(&mut self, value: u16) {
-		println!("Push16({})", value);
+		//println!("Push16({})", value);
 		self.sub_from_reg(Reg::SP, 2);
 		self.poke_u16(self.get_sp(), value);
 	}
 	
 	fn pop_u16(&mut self) -> u16 {
 		let value = self.peek_u16(self.get_sp());
-		println!("Pop16({})", value);
+		//println!("Pop16({})", value);
 		self.add_to_reg(Reg::SP, 2);
 		value
 	}
@@ -946,21 +964,23 @@ impl Machine8086 {
 
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
-		//println!("{:?}", self.registers);
-		println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+		if self.number_of_parsed_instructions > 697000 {
+			println!("{:?}", self.registers);
+			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+		}
 		self.number_of_parsed_instructions += 1;
 		// 673096
-		/*if self.number_of_parsed_instructions == 673099 {
+		if self.number_of_parsed_instructions == 697700 {
 			panic!();
-		}*/
+		}
 		//println!("IP: {:?}", self.get_ip());
 		match opcode {
 			0x00 ... 0x05 => {
 				let inst = Inst::Arithmetic(ArithmeticMode::Add, self.read_arithmetic_source_destination_with_ax(opcode));
-				if opcode == 0x01 {
+				/*if opcode == 0x01 {
 					println!("{:?}", inst);
 					println!("{:?}, {:?}", self.get_reg_u16(Reg::AX), self.get_reg_u16(Reg::DS));
-				}
+				}*/
 				inst
 			}
 			0x06 => Inst::Push16(DataLocation16::Reg(Reg::ES)),
@@ -1035,7 +1055,7 @@ impl Machine8086 {
 				let raw_imm = self.read_ip_u8();
 				// Read a u8 then sign-extend it to u16:
 				let imm = treat_i16_as_u16(treat_u8_as_i8(raw_imm) as i16);
-				println!("0x83 {}, {}", raw_imm, imm);
+				//println!("0x83 {}, {}", raw_imm, imm);
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size16(DataLocation16::Immediate(imm as u16), destination))
 			}
 			0x88 ... 0x8b => Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS)),
@@ -1109,7 +1129,10 @@ impl Machine8086 {
 			}
 			// LES (load absolute pointer in the ES segment)
 			0xc4 => {
-				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Imm, Reg::DS, None);
+				let modrm = self.read_ip_u8();
+				let disp = self.read_ip_u8();
+				panic!("c4: {:b}, {:?}, {:?}", modrm, disp, self.number_of_parsed_instructions);
+				/*let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None);
 				match source_destination {
 					SourceDestination::Size16(source, destination) => {
 						let source_value = self.get_data_u16(&source);
@@ -1117,7 +1140,7 @@ impl Machine8086 {
 						//self.resolve_default_segment(source)
 					}
 					_ => panic!("Expected 16-bit result")
-				}
+				}*/
 			}
 			0xc6 => {
 				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None).split();
@@ -1366,7 +1389,8 @@ impl Machine8086 {
 	}
 	
 	fn interrupt(&mut self, interrupt_index: u8) {
-		let interrupt_addr = (interrupt_index as u32) * 4;
+		println!("Interrupt: {:?}", interrupt_index);
+		let interrupt_addr = (interrupt_index as u32) << 2;
 		let ip = self.peek_u16(interrupt_addr);
 		let cs = self.peek_u16(interrupt_addr + 2);
 		
@@ -1378,6 +1402,19 @@ impl Machine8086 {
 		self.set_reg_u16(Reg::CS, cs);
 		self.halted = false;
 		self.set_flag(Flag::Interrupt, false);
+	}
+	
+	fn return_from_interrupt(&mut self) {
+		let ip = self.pop_u16();
+		let cs = self.pop_u16();
+		let old_flags = self.pop_u16();
+		let interrupt_flag_bit = 0b1 << (Flag::Interrupt as u16);
+		let old_interrupt_flag = (old_flags & interrupt_flag_bit) != 0;
+		
+		self.set_reg_u16(Reg::IP, ip);
+		self.set_reg_u16(Reg::CS, cs);
+		
+		self.set_flag(Flag::Interrupt, old_interrupt_flag);
 	}
 	
 	fn apply_instruction(&mut self, inst: &Inst) {
@@ -1590,6 +1627,40 @@ impl Machine8086 {
 			}
 		}
 	}
+	
+	/// Parse and execute one instruction. If there are interrupts to be handled, this will do that instead.
+	fn step(&mut self, event_handler: &mut EventHandler) {
+		// TODO: Improve this check.
+		let ip = self.get_reg_u16(Reg::IP);
+		let cs = self.get_reg_u16(Reg::CS);
+		//println!("{:x}, {:x}", ip, cs);
+		if (ip & 0xff00) == 0x1100 && cs == 0xf000 {
+			self.set_flag(Flag::Interrupt, true);
+			let interrupt_index = (ip & 0xff) as u8;
+			let interrupt_result = event_handler.handle_interrupt(self, interrupt_index);
+			match interrupt_result {
+				InterruptResult::Return => {
+					self.return_from_interrupt();
+				}
+				InterruptResult::Stop => {
+					panic!();
+				}
+			}
+		}
+		
+		let inst = self.parse_instruction();
+		//println!("{:?}", inst);
+		self.apply_instruction(&inst);
+	}
+}
+
+struct DosEventHandler;
+
+impl EventHandler for DosEventHandler {
+	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult {
+		println!("Handle interrupt: {:?}", interrupt_index);
+		InterruptResult::Return
+	}
 }
 
 // https://en.wikipedia.org/wiki/Program_Segment_Prefix
@@ -1606,9 +1677,8 @@ fn main() {
     //println!("{:#?}", exe_header);
     let mut machine = Machine8086::new(1024*1024*1);
     exe_header.load_into_machine(&mut machine, &mut file);
+    let mut event_handler = DosEventHandler;
     loop {
-		let inst = machine.parse_instruction();
-		//println!("{:?}", inst);
-		machine.apply_instruction(&inst);
+		machine.step(&mut event_handler);
 	}
 }
