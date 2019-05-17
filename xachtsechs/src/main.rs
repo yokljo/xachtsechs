@@ -1,6 +1,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Seek;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use num::FromPrimitive;
 use num_derive::FromPrimitive;
 
@@ -506,10 +507,15 @@ trait EventHandler {
 	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult;
 }
 
+/// This is the size of one entry in the interrupt table. Each entry consists of a IP, followed by
+/// the associated CS.
+const INTERRUPT_TABLE_ENTRY_BYTES: usize = 2 + 2;
+
 struct Machine8086 {
 	memory: Vec<u8>,
 	registers: [u16; REG_COUNT],
 	halted: bool,
+	pending_interrupts: VecDeque<u8>,
 	
 	override_default_segment: Option<Reg>,
 	number_of_parsed_instructions: usize,
@@ -521,6 +527,7 @@ impl Machine8086 {
 			memory: vec![0; memory_bytes],
 			registers: [0; REG_COUNT as usize],
 			halted: false,
+			pending_interrupts: VecDeque::new(),
 			
 			override_default_segment: None,
 			number_of_parsed_instructions: 0,
@@ -532,7 +539,7 @@ impl Machine8086 {
 		
 		// Configure the interrupt table.
 		for i in 0..256u16 {
-			let addr = (i << 2) as u32;
+			let addr = i as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
 			// The IP to jump to.
 			machine.poke_u16(addr, 0x1100 + i);
 			// The CS the IP is within.
@@ -1002,6 +1009,12 @@ impl Machine8086 {
 				inst
 			}
 			0x30 ... 0x35 => Inst::Arithmetic(ArithmeticMode::Xor, self.read_arithmetic_source_destination_with_ax(opcode)),
+			0x36 => {
+				self.override_default_segment = Some(Reg::SS);
+				let inst = self.parse_instruction();
+				self.override_default_segment = None;
+				inst
+			}
 			0x38 ... 0x3d => Inst::Arithmetic(ArithmeticMode::Cmp, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x3c => {
 				let imm = self.read_ip_u8();
@@ -1390,7 +1403,7 @@ impl Machine8086 {
 	
 	fn interrupt(&mut self, interrupt_index: u8) {
 		println!("Interrupt: {:?}", interrupt_index);
-		let interrupt_addr = (interrupt_index as u32) << 2;
+		let interrupt_addr = interrupt_index as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
 		let ip = self.peek_u16(interrupt_addr);
 		let cs = self.peek_u16(interrupt_addr + 2);
 		
@@ -1415,6 +1428,10 @@ impl Machine8086 {
 		self.set_reg_u16(Reg::CS, cs);
 		
 		self.set_flag(Flag::Interrupt, old_interrupt_flag);
+	}
+	
+	fn interrupt_on_next_step(&mut self, interrupt_index: u8) {
+		self.pending_interrupts.push_back(interrupt_index);
 	}
 	
 	fn apply_instruction(&mut self, inst: &Inst) {
@@ -1630,9 +1647,19 @@ impl Machine8086 {
 	
 	/// Parse and execute one instruction. If there are interrupts to be handled, this will do that instead.
 	fn step(&mut self, event_handler: &mut EventHandler) {
+		let non_maskable_bios_interrupt = 0x02;
+		
+		if self.get_flag(Flag::Interrupt)
+				|| self.pending_interrupts.front() == Some(&non_maskable_bios_interrupt) {
+			if let Some(interrupt_index) = self.pending_interrupts.pop_front() {
+				self.interrupt(interrupt_index);
+			}
+		}
+	
 		// TODO: Improve this check.
 		let ip = self.get_reg_u16(Reg::IP);
 		let cs = self.get_reg_u16(Reg::CS);
+		let mut handled_interrupt = false;
 		//println!("{:x}, {:x}", ip, cs);
 		if (ip & 0xff00) == 0x1100 && cs == 0xf000 {
 			self.set_flag(Flag::Interrupt, true);
@@ -1646,11 +1673,15 @@ impl Machine8086 {
 					panic!();
 				}
 			}
+			
+			handled_interrupt = true;
 		}
 		
-		let inst = self.parse_instruction();
-		//println!("{:?}", inst);
-		self.apply_instruction(&inst);
+		if !handled_interrupt {
+			let inst = self.parse_instruction();
+			//println!("{:?}", inst);
+			self.apply_instruction(&inst);
+		}
 	}
 }
 
@@ -1658,7 +1689,42 @@ struct DosEventHandler;
 
 impl EventHandler for DosEventHandler {
 	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult {
-		println!("Handle interrupt: {:?}", interrupt_index);
+		// https://www.shsu.edu/~csc_tjm/spring2001/cs272/interrupt.html
+		println!("Handle interrupt: 0x{:x}", interrupt_index);
+		match interrupt_index {
+			// BIOS Interrupts (0x00-0x1F):
+			0x02 => {
+				// Non-maskable interrupt
+				panic!("Memory corruption error, apparently...");
+			}
+			
+			// This is the DOS interrupt.
+			// http://spike.scu.edu.au/~barry/interrupts.html
+			0x21 => {
+				let dos_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
+				println!("DOS Interrupt: 0x{:x}", dos_int);
+				match dos_int {
+					0x25 => {
+						let entry_addr = machine.get_reg_u8(Reg::AX, RegHalf::Low) as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
+						let interrupt_ip = machine.get_reg_u16(Reg::DX);
+						let interrupt_cs = machine.get_reg_u16(Reg::DS);
+						machine.poke_u16(entry_addr, interrupt_ip);
+						machine.poke_u16(entry_addr + 2, interrupt_cs);
+					}
+					0x35 => {
+						// Get an entry of the interrupt vector/table (IP:CS) and store it in ES:BX.
+						let entry_addr = machine.get_reg_u8(Reg::AX, RegHalf::Low) as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
+						let interrupt_ip = machine.peek_u16(entry_addr);
+						let interrupt_cs = machine.peek_u16(entry_addr + 2);
+						machine.set_reg_u16(Reg::ES, interrupt_ip);
+						machine.set_reg_u16(Reg::BX, interrupt_cs);
+					}
+					_ => {panic!();}
+				}
+			}
+			_ => {panic!();}
+		}
+		
 		InterruptResult::Return
 	}
 }
