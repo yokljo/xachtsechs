@@ -111,7 +111,20 @@ impl MzHeader {
 		
 		let exe_data = self.extract_data(stream).unwrap();
 		machine.insert_contiguous_bytes(&exe_data, (EXE_ORIGIN_PARAGRAPH + 16) * EXE_PARAGRAPH_BYTES);
+		
+		initialise_dos_program_segment_prefix(machine, exe_data.len());
 	}
+}
+
+// https://en.wikipedia.org/wiki/Program_Segment_Prefix
+fn initialise_dos_program_segment_prefix(machine: &mut Machine8086, program_size: usize) {
+	// The DS register will be the PSP location when a program starts.
+	let psp_start = machine.get_seg_origin(Reg::DS);
+	// CP/M exit: Always 20h
+	machine.poke_u16(psp_start + 0x00, 0x20);
+	// Segment after the memeory allocated to the program.
+	dbg!((psp_start, program_size));
+	//machine.poke_u16(psp_start + 0x02, 0x20);
 }
 
 trait AnyUnsignedInt8086
@@ -410,21 +423,26 @@ enum ModRmRegMode {
 	Imm,
 }
 
+// This is a memory address without the segment applied to it.
+#[derive(Debug, Clone, PartialEq)]
+enum Address16 {
+	Reg(Reg),
+	DisplacementRel(DisplacementOrigin, u16),
+	Immediate(u16),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum DataLocation8 {
 	Reg(Reg, RegHalf),
-	AddrSegReg{seg: Reg, reg: Reg},
-	//AddrSegRel(Reg, i32),
-	AddrDisplacementRel{seg: Reg, displacement: Option<DisplacementOrigin>, offset: i32},
+	Memory{seg: Reg, address16: Address16},
 	Immediate(u8),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum DataLocation16 {
 	Reg(Reg),
-	AddrSegReg{seg: Reg, reg: Reg},
-	//AddrSegRel(Reg, i32),
-	AddrDisplacementRel{seg: Reg, displacement: Option<DisplacementOrigin>, offset: i32},
+	Memory{seg: Reg, address16: Address16},
+	Address16(Address16),
 	Immediate(u16),
 }
 
@@ -472,6 +490,9 @@ enum Inst {
 	// associated registers?
 	MovAndIncrement(SourceDestination, Reg, Option<Reg>),
 	MovReg32{source_h: Reg, source_l: Reg, dest_h: Reg, dest_l: Reg},
+	
+	Load32{seg: Reg, address16: Address16, out_reg_h: Reg, out_reg_l: Reg},
+	
 	Arithmetic(ArithmeticMode, SourceDestination),
 	Inc(DataLocation),
 	Dec(DataLocation),
@@ -486,9 +507,12 @@ enum Inst {
 	// the first place.
 	Ret{extra_pop: u16},
 	CallAbsolute{ip: u16, cs: u16},
-	RetAbsolute,
+	// From the memory address, read two bytes as the IP and CS values, then do the same thing as
+	// CallAbsolute does.
+	CallAbsoluteWithAddress{seg: Reg, address16: Address16},
+	RetAbsolute{extra_pop: u16},
 	Jump{condition: Option<JumpCondition>, offset: i32},
-	JumpAbsolute{seg: Reg, displacement: Option<DisplacementOrigin>, offset: i32},
+	JumpAbsolute{seg: Reg, address16: Address16},
 	JumpAndDecrementUntilZero{offset: i32, dec_reg: Reg},
 	JumpZeroReg{offset: i32, reg: Reg},
 	Interrupt(u8),
@@ -566,49 +590,39 @@ impl Machine8086 {
 		}
 	}
 	
+	fn calculate_effective_address16(&self, address16: &Address16) -> u16 {
+		match *address16 {
+			Address16::Reg(reg) => {
+				self.get_reg_u16(reg)
+			}
+			Address16::DisplacementRel(displacement, offset) => {
+				self.calculate_displacement(displacement).wrapping_add(offset)
+			}
+			Address16::Immediate(addr) => addr,
+		}
+	}
+	
 	fn get_data_u8(&self, location: &DataLocation8) -> u8 {
-		match location {
+		match *location {
 			DataLocation8::Reg(reg, half) => {
-				self.get_reg_u8(*reg, *half)
+				self.get_reg_u8(reg, half)
 			}
-			DataLocation8::AddrSegReg{seg, reg} => {
-				let origin = self.get_seg_reg(*seg, *reg);
-				self.peek_u8(origin)
+			DataLocation8::Memory{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				self.peek_u8(addr)
 			}
-			/*DataLocation8::AddrSegRel(seg, offset) => {
-				let origin = self.get_seg_origin(*seg);
-				self.peek_u8((origin as i32 + offset) as u32)
-			}*/
-			DataLocation8::AddrDisplacementRel{seg, displacement, offset} => {
-				let mut origin = self.get_seg_origin(*seg);
-				if let Some(displacement) = displacement {
-					origin += self.calculate_displacement(*displacement) as u32;
-				}
-				self.peek_u8(((origin as i32) + *offset) as u32)
-			}
-			DataLocation8::Immediate(value) => *value,
+			DataLocation8::Immediate(value) => value,
 		}
 	}
 	
 	fn set_data_u8(&mut self, location: &DataLocation8, value: u8) {
-		match location {
+		match *location {
 			DataLocation8::Reg(reg, half) => {
-				self.set_reg_u8(*reg, *half, value);
+				self.set_reg_u8(reg, half, value);
 			}
-			DataLocation8::AddrSegReg{seg, reg} => {
-				let origin = self.get_seg_reg(*seg, *reg);
-				self.poke_u8(origin, value);
-			}
-			/*DataLocation8::AddrSegRel(seg, offset) => {
-				let origin = self.get_seg_origin(*seg);
-				self.poke_u8((origin as i32 + offset) as u32, value);
-			}*/
-			DataLocation8::AddrDisplacementRel{seg, displacement, offset} => {
-				let mut origin = self.get_seg_origin(*seg);
-				if let Some(displacement) = displacement {
-					origin += self.calculate_displacement(*displacement) as u32;
-				}
-				self.poke_u8(((origin as i32) + *offset) as u32, value);
+			DataLocation8::Memory{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				self.poke_u8(addr, value);
 			}
 			DataLocation8::Immediate(value) => panic!("Attempted to use immediate as destination: {}", value),
 		}
@@ -625,50 +639,31 @@ impl Machine8086 {
 	}
 	
 	fn get_data_u16(&self, location: &DataLocation16) -> u16 {
-		match location {
+		match *location {
 			DataLocation16::Reg(reg) => {
-				self.get_reg_u16(*reg)
+				self.get_reg_u16(reg)
 			}
-			DataLocation16::AddrSegReg{seg, reg} => {
-				let origin = self.get_seg_reg(*seg, *reg);
-				self.peek_u16(origin)
+			DataLocation16::Memory{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				self.peek_u16(addr)
 			}
-			/*DataLocation16::AddrSegRel(seg, offset) => {
-				let origin = self.get_seg_origin(*seg);
-				//println!("{:?}", (origin as i32 + offset) as u32);
-				self.peek_u16((origin as i32 + offset) as u32)
-			}*/
-			DataLocation16::AddrDisplacementRel{seg, displacement, offset} => {
-				let mut origin = self.get_seg_origin(*seg);
-				if let Some(displacement) = displacement {
-					origin += self.calculate_displacement(*displacement) as u32;
-				}
-				self.peek_u16(((origin as i32) + *offset) as u32)
+			DataLocation16::Address16(ref address16) => {
+				self.calculate_effective_address16(&address16)
 			}
-			DataLocation16::Immediate(value) => *value,
+			DataLocation16::Immediate(value) => value,
 		}
 	}
 	
 	fn set_data_u16(&mut self, location: &DataLocation16, value: u16) {
-		match location {
+		match *location {
 			DataLocation16::Reg(reg) => {
-				self.set_reg_u16(*reg, value);
+				self.set_reg_u16(reg, value);
 			}
-			DataLocation16::AddrSegReg{seg, reg} => {
-				let origin = self.get_seg_reg(*seg, *reg);
-				self.poke_u16(origin, value);
+			DataLocation16::Memory{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				self.poke_u16(addr, value);
 			}
-			/*DataLocation16::AddrSegRel(seg, offset) => {
-				let origin = self.get_seg_origin(*seg);
-				self.poke_u16((origin as i32 + offset) as u32, value);
-			}*/
-			DataLocation16::AddrDisplacementRel{seg, displacement, offset} => {
-				let mut origin = self.get_seg_origin(*seg);
-				if let Some(displacement) = displacement {
-					origin += self.calculate_displacement(*displacement) as u32;
-				}
-				self.poke_u16(((origin as i32) + *offset) as u32, value);
-			}
+			DataLocation16::Address16(ref address16) => panic!("Attempted to use address as destination: {}", value),
 			DataLocation16::Immediate(value) => panic!("Attempted to use immediate as destination: {}", value),
 		}
 	}
@@ -723,6 +718,10 @@ impl Machine8086 {
 
 	fn get_seg_origin(&self, seg_reg: Reg) -> u32 {
 		((self.registers[seg_reg as usize] as u32) << 4) & 0xFFFFF
+	}
+
+	fn get_seg_offset(&self, seg_reg: Reg, offset: u16) -> u32 {
+		(((self.registers[seg_reg as usize] as u32) << 4) + offset as u32) & 0xFFFFF
 	}
 
 	fn get_seg_reg(&self, seg_reg: Reg, reg: Reg) -> u32 {
@@ -848,7 +847,7 @@ impl Machine8086 {
 		};
 		
 		let mut second: Option<DataLocation> = None;
-		let mut displacement: Option<i32> = None;
+		let mut displacement: Option<u16> = None;
 		
 		let displacement_origin = match rm_code {
 			0b000 => DisplacementOrigin::BX_SI,
@@ -866,12 +865,12 @@ impl Machine8086 {
 			0b00 => {
 				// If r/m is 110, Displacement (16 bits) is address; otherwise, no displacement
 				if rm_code == 0b110 {
-					let addr = self.read_ip_u16() as i32;
+					let addr = self.read_ip_u16();
 					// Displacements are relative to the data segment (DS)
 					let seg = self.resolve_default_segment(default_segment);
 					second = Some(match opsize {
-						OpSize::Size8 => DataLocation::Size8(DataLocation8::AddrDisplacementRel{seg, displacement: None, offset: addr}),
-						OpSize::Size16 => DataLocation::Size16(DataLocation16::AddrDisplacementRel{seg, displacement: None, offset: addr}),
+						OpSize::Size8 => DataLocation::Size8(DataLocation8::Memory{seg, address16: Address16::Immediate(addr)}),
+						OpSize::Size16 => DataLocation::Size16(DataLocation16::Memory{seg, address16: Address16::Immediate(addr)}),
 					});
 				} else {
 					displacement = Some(0);
@@ -880,11 +879,11 @@ impl Machine8086 {
 			}
 			0b01 => {
 				// Eight-bit displacement, sign-extended to 16 bits
-				displacement = Some(treat_u8_as_i8(self.read_ip_u8()) as i32);
+				displacement = Some(treat_i16_as_u16(treat_u8_as_i8(self.read_ip_u8()) as i16));
 			}
 			0b10 => {
 				// 16-bit displacement (example: MOV [BX + SI]+ displacement,al)
-				displacement = Some(treat_u16_as_i16(self.read_ip_u16()) as i32);
+				displacement = Some(self.read_ip_u16());
 			}
 			0b11 => {
 				// r/m is treated as a second "reg" field
@@ -902,8 +901,8 @@ impl Machine8086 {
 		if let Some(offset) = displacement {
 			let seg = self.resolve_default_segment(default_segment);
 			second = Some(match opsize {
-				OpSize::Size8 => DataLocation::Size8(DataLocation8::AddrDisplacementRel{seg, displacement: Some(displacement_origin), offset}),
-				OpSize::Size16 => DataLocation::Size16(DataLocation16::AddrDisplacementRel{seg, displacement: Some(displacement_origin), offset}),
+				OpSize::Size8 => DataLocation::Size8(DataLocation8::Memory{seg, address16: Address16::DisplacementRel(displacement_origin, offset)}),
+				OpSize::Size16 => DataLocation::Size16(DataLocation16::Memory{seg, address16: Address16::DisplacementRel(displacement_origin, offset)}),
 			});
 		}
 		
@@ -971,13 +970,14 @@ impl Machine8086 {
 
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
-		if self.number_of_parsed_instructions > 697000 {
+		// TODO: 697514/0xa1
+		if self.number_of_parsed_instructions > 0{//697000 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
 		// 673096
-		if self.number_of_parsed_instructions == 697700 {
+		if self.number_of_parsed_instructions > 697516 {//697762 {
 			panic!();
 		}
 		//println!("IP: {:?}", self.get_ip());
@@ -1073,6 +1073,14 @@ impl Machine8086 {
 			}
 			0x88 ... 0x8b => Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS)),
 			0x8c => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Seg, Reg::DS, None)),
+			0x8d => {
+				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Seg, Reg::DS, None);
+				if let SourceDestination::Size16(DataLocation16::Memory{address16, ..}, destination) = source_destination {
+					Inst::Mov(SourceDestination::Size16(DataLocation16::Address16(address16), destination))
+				} else {
+					panic!("Expected Memory as the source {:?}", source_destination);
+				}
+			}
 			0x8e => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Seg, Reg::DS, None)),
 			0x90 ... 0x97 => {
 				let reg = Reg::reg16((opcode & 0b111) as usize).unwrap();
@@ -1084,31 +1092,38 @@ impl Machine8086 {
 				let cs = self.read_ip_u16();
 				Inst::CallAbsolute{ip, cs}
 			},
+			// MOV (moffs16 -> AX)
 			0xa1 => {
-				let addr = self.read_ip_u16();
-				Inst::Mov(SourceDestination::Size16(DataLocation16::AddrDisplacementRel{seg: self.resolve_default_segment(Reg::DS), displacement: None, offset: addr as i32}, DataLocation16::Reg(Reg::AX)))
+				// TODO: Broken at 697514
+				let offset = self.read_ip_u16();
+				let addr = self.get_seg_offset(self.resolve_default_segment(Reg::DS), offset) as usize;
+				println!("{:?}", addr);
+				for b in &self.memory[addr..addr+10] {
+					println!("a1: {}", b);
+				}
+				Inst::Mov(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(offset)}, DataLocation16::Reg(Reg::AX)))
 			}
 			0xa2 => {
 				let addr = self.read_ip_u16();
-				Inst::Mov(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::AddrDisplacementRel{seg: self.resolve_default_segment(Reg::DS), displacement: None, offset: addr as i32}))
+				Inst::Mov(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(addr)}))
 			}
 			0xa3 => {
 				let addr = self.read_ip_u16();
-				Inst::Mov(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::AddrDisplacementRel{seg: self.resolve_default_segment(Reg::DS), displacement: None, offset: addr as i32}))
+				Inst::Mov(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(addr)}))
 			}
 			// MOVSB 
 			// "string" means that it increments (or decrements if the direction flag is set) the
 			// memory address register(s) after doing an operation.
-			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::AddrSegReg{seg: Reg::DS, reg: Reg::SI}, DataLocation8::AddrSegReg{seg: Reg::ES, reg: Reg::DI}), Reg::SI, Some(Reg::DI)),
-			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::AddrSegReg{seg: Reg::DS, reg: Reg::SI}, DataLocation16::AddrSegReg{seg: Reg::ES, reg: Reg::DI}), Reg::SI, Some(Reg::DI)),
+			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
 			// STOSB
-			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::AddrSegReg{seg: Reg::ES, reg: Reg::DI}), Reg::DI, None),
+			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// STOSW
-			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::AddrSegReg{seg: Reg::ES, reg: Reg::DI}), Reg::DI, None),
+			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// LODSB
-			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::AddrSegReg{seg: Reg::DS, reg: Reg::SI}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
+			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
 			// LODSW
-			0xad => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::AddrSegReg{seg: Reg::DS, reg: Reg::SI}, DataLocation16::Reg(Reg::AX)), Reg::SI, None),
+			0xad => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation16::Reg(Reg::AX)), Reg::SI, None),
 			0xb0 ... 0xb7 => {
 				let (reg, reg_half) = Reg::reg8((opcode & 0b111) as usize).unwrap();
 				let imm = self.read_ip_u8();
@@ -1140,20 +1155,15 @@ impl Machine8086 {
 			0xc3 => {
 				Inst::Ret{extra_pop: 0}
 			}
-			// LES (load absolute pointer in the ES segment)
-			0xc4 => {
-				let modrm = self.read_ip_u8();
-				let disp = self.read_ip_u8();
-				panic!("c4: {:b}, {:?}, {:?}", modrm, disp, self.number_of_parsed_instructions);
-				/*let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None);
-				match source_destination {
-					SourceDestination::Size16(source, destination) => {
-						let source_value = self.get_data_u16(&source);
-						panic!("c4: {:?} -> {:?} ({:?})", source, destination, source_value);
-						//self.resolve_default_segment(source)
-					}
-					_ => panic!("Expected 16-bit result")
-				}*/
+			// LES | LDS (load absolute pointer in the ES/DS segment)
+			0xc4 | 0xc5 => {
+				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None);
+				if let SourceDestination::Size16(DataLocation16::Memory{seg, address16: Address16::DisplacementRel(displacement, offset)}, DataLocation16::Reg(out_reg_l)) = source_destination {
+					let out_reg_h = if opcode == 0xc4 { Reg::ES } else { Reg::DS };
+					Inst::Load32{seg, address16: Address16::DisplacementRel(displacement, offset), out_reg_h, out_reg_l}
+				} else {
+					panic!("Expected source to be Memory/DisplacementRel and destination to be Reg: {:?}", source_destination);
+				}
 			}
 			0xc6 => {
 				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None).split();
@@ -1165,10 +1175,18 @@ impl Machine8086 {
 				let imm = self.read_ip_u16();
 				Inst::Mov(destination.with_immediate_source(imm))
 			}
-			0xcb => Inst::RetAbsolute,
+			0xca => {
+				let extra_pop = self.read_ip_u16();
+				Inst::RetAbsolute{extra_pop}
+			}
+			0xcb => Inst::RetAbsolute{extra_pop: 0},
 			0xcd => {
 				let interrupt_index = self.read_ip_u8();
 				Inst::Interrupt(interrupt_index)
+			}
+			0xce => {
+				// INTO calls the overflow exception, which is #4
+				Inst::Interrupt(4)
 			}
 			0xd0 => {
 				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
@@ -1223,15 +1241,22 @@ impl Machine8086 {
 			0xff => {
 				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
 				match inst_index {
+					3 => {
+						if let DataLocation16::Memory{seg, address16} = destination {
+							Inst::CallAbsoluteWithAddress{seg, address16}
+						} else {
+							panic!("Expected Memory for CALLF: {:?}", destination);
+						}
+					}
 					5 => {
 						// JMPF (jump far)
 						// This gets the modrm destination (which should be a seg/offset for getting
 						// a memory address) and reads 32 bits from that position. The first 16 bits
 						// go into the IP and the second 16 go into the CS.
-						if let DataLocation16::AddrDisplacementRel{seg, displacement, offset} = destination {
-							Inst::JumpAbsolute{seg, displacement, offset}
+						if let DataLocation16::Memory{seg, address16} = destination {
+							Inst::JumpAbsolute{seg, address16}
 						} else {
-							panic!("Expected AddrDisplacementRel for JMPF: {:?}", destination);
+							panic!("Expected Memory for JMPF: {:?}", destination);
 						}
 					}
 					_ => panic!("Unknown 0xff mode: {:?}", inst_index)
@@ -1452,6 +1477,13 @@ impl Machine8086 {
 				let value = self.get_data_u16(&source);
 				self.set_data_u16(&destination, value);
 			}
+			Inst::Load32{seg, ref address16, out_reg_h, out_reg_l} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				let in_h = self.peek_u16(addr);
+				let in_l = self.peek_u16(addr + 2);
+				self.set_reg_u16(out_reg_h, in_h);
+				self.set_reg_u16(out_reg_l, in_l);
+			}
 			Inst::Swap(SourceDestination::Size8(ref left, ref right)) => {
 				let value_left = self.get_data_u8(&left);
 				let value_right = self.get_data_u8(&right);
@@ -1584,11 +1616,21 @@ impl Machine8086 {
 				self.set_reg_u16(Reg::CS, cs);
 				self.set_reg_u16(Reg::IP, ip);
 			}
-			Inst::RetAbsolute => {
+			Inst::CallAbsoluteWithAddress{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
+				let ip = self.peek_u16(addr);
+				let cs = self.peek_u16(addr + 2);
+				self.push_u16(self.get_reg_u16(Reg::CS));
+				self.push_u16(self.get_reg_u16(Reg::IP));
+				self.set_reg_u16(Reg::CS, cs);
+				self.set_reg_u16(Reg::IP, ip);
+			}
+			Inst::RetAbsolute{extra_pop} => {
 				let ip = self.pop_u16();
 				let cs = self.pop_u16();
 				self.set_reg_u16(Reg::IP, ip);
 				self.set_reg_u16(Reg::CS, cs);
+				self.add_to_reg(Reg::SP, extra_pop);
 			}
 			Inst::Jump{ref condition, offset} => {
 				let do_jump = if let Some(condition) = condition {
@@ -1603,12 +1645,8 @@ impl Machine8086 {
 					self.set_reg_u16(Reg::IP, (ip as i32 + offset) as u16);
 				}
 			}
-			Inst::JumpAbsolute{seg, displacement, offset} => {
-				let mut seg_origin = self.get_seg_origin(seg);
-				if let Some(displacement) = displacement {
-					seg_origin += self.calculate_displacement(displacement) as u32;
-				}
-				let addr = (seg_origin as i32 + offset) as u32;
+			Inst::JumpAbsolute{seg, ref address16} => {
+				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(address16));
 				let ip = self.peek_u16(addr);
 				let cs = self.peek_u16(addr + 2);
 				self.set_reg_u16(Reg::IP, ip);
@@ -1740,7 +1778,7 @@ impl EventHandler for DosEventHandler {
 fn main() {
     let mut file = std::fs::File::open("ZZT.EXE").unwrap();
     let exe_header = MzHeader::parse(&mut file).unwrap();
-    //println!("{:#?}", exe_header);
+    println!("{:#?}", exe_header);
     let mut machine = Machine8086::new(1024*1024*1);
     exe_header.load_into_machine(&mut machine, &mut file);
     let mut event_handler = DosEventHandler;
