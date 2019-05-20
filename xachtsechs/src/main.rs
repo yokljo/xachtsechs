@@ -112,19 +112,57 @@ impl MzHeader {
 		let exe_data = self.extract_data(stream).unwrap();
 		machine.insert_contiguous_bytes(&exe_data, (EXE_ORIGIN_PARAGRAPH + 16) * EXE_PARAGRAPH_BYTES);
 		
-		initialise_dos_program_segment_prefix(machine, exe_data.len());
+		initialise_bios_data_area(machine);
+		initialise_dos_program_segment_prefix(machine, exe_data.len(), b"");
+		
+		/*for (i, b) in machine.memory[10000..20000].iter().enumerate() {
+			println!("{}: {:02x}", i + 10000, b);
+		}
+		panic!();*/
 	}
 }
 
+// http://www.bioscentral.com/misc/bda.htm
+fn initialise_bios_data_area(machine: &mut Machine8086) {
+	// The BIOS Data Area starts at the start of the 0x40 segment.
+	let bios_start = 0x40 << 4;
+	// Equipment
+	machine.poke_u16(bios_start + 0x10, 0x0061);
+	// Memory size in KB
+	machine.poke_u16(bios_start + 0x13, 640);
+	// Text column count for the video mode
+	machine.poke_u16(bios_start + 0x4a, 80);
+	// Port for video I/O
+	machine.poke_u16(bios_start + 0x63, 0xd403);
+	
+}
+
 // https://en.wikipedia.org/wiki/Program_Segment_Prefix
-fn initialise_dos_program_segment_prefix(machine: &mut Machine8086, program_size: usize) {
+fn initialise_dos_program_segment_prefix(machine: &mut Machine8086, program_size: usize, command_line_tail: &[u8]) -> Result<(), String> {
 	// The DS register will be the PSP location when a program starts.
 	let psp_start = machine.get_seg_origin(Reg::DS);
 	// CP/M exit: Always 20h
-	machine.poke_u16(psp_start + 0x00, 0x20);
+	//machine.poke_u16(psp_start + 0x00, 0x20);
+	// These values are probably all wrong:
+	
 	// Segment after the memeory allocated to the program.
 	dbg!((psp_start, program_size));
-	//machine.poke_u16(psp_start + 0x02, 0x20);
+	machine.poke_u16(psp_start + 0x02, 0xa000);
+	
+	// +1 for the 0x0d teminator character.
+	let command_line_tail_len = command_line_tail.len() + 1;
+	if command_line_tail_len > 0xff {
+		return Err(format!("Command line tail too long: {}", command_line_tail.len()));
+	}
+	machine.poke_u8(psp_start + 0x80, command_line_tail_len as u8);
+	let mut current_command_line_pos = psp_start + 0x81;
+	for byte in command_line_tail {
+		machine.poke_u8(current_command_line_pos, *byte);
+		current_command_line_pos += 1;
+	}
+	machine.poke_u8(current_command_line_pos, 0x0d);
+	
+	Ok(())
 }
 
 trait AnyUnsignedInt8086
@@ -516,6 +554,7 @@ enum Inst {
 	JumpAndDecrementUntilZero{offset: i32, dec_reg: Reg},
 	JumpZeroReg{offset: i32, reg: Reg},
 	Interrupt(u8),
+	InterruptIf(u8, Flag),
 	Halt,
 	// Override the default segment for the next instruction.
 	// https://www.quora.com/Why-is-a-segment-override-prefix-used-with-an-example-in-8086-microprocessor
@@ -972,29 +1011,35 @@ impl Machine8086 {
 		let opcode = self.read_ip_u8();
 		// TODO: 697514/0xa1
 		if self.number_of_parsed_instructions > 0{//697000 {
-			println!("{:?}", self.registers);
-			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+			//println!("{:?}", self.registers);
+			//println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
 		// 673096
-		if self.number_of_parsed_instructions > 697516 {//697762 {
+		/*if self.number_of_parsed_instructions > 697516 {//697762 {
 			panic!();
-		}
+		}*/
 		//println!("IP: {:?}", self.get_ip());
 		match opcode {
-			0x00 ... 0x05 => {
-				let inst = Inst::Arithmetic(ArithmeticMode::Add, self.read_arithmetic_source_destination_with_ax(opcode));
-				/*if opcode == 0x01 {
-					println!("{:?}", inst);
-					println!("{:?}, {:?}", self.get_reg_u16(Reg::AX), self.get_reg_u16(Reg::DS));
-				}*/
-				inst
-			}
+			0x00 ... 0x05 => Inst::Arithmetic(ArithmeticMode::Add, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x06 => Inst::Push16(DataLocation16::Reg(Reg::ES)),
+			0x07 => Inst::Pop16(DataLocation16::Reg(Reg::ES)),
 			0x08 ... 0x0d => Inst::Arithmetic(ArithmeticMode::Or, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x0e => Inst::Push16(DataLocation16::Reg(Reg::CS)),
+			0x0f => {
+				// This opcode is undocumented. Apparently it's a fluke that it exists, because the
+				// CPU doesn't consider all the bits when processing an instruction, so it ends up
+				// as a duplicate of a different instruction (probably 0x1f).
+				// See: http://www.os2museum.com/wp/undocumented-8086-opcodes-part-i/
+				Inst::Pop16(DataLocation16::Reg(Reg::CS))
+			}
+			0x10 ... 0x15 => Inst::Arithmetic(ArithmeticMode::AddWithCarry, self.read_arithmetic_source_destination_with_ax(opcode)),
+			0x16 => Inst::Push16(DataLocation16::Reg(Reg::SS)),
+			0x17 => Inst::Pop16(DataLocation16::Reg(Reg::SS)),
+			0x18 ... 0x1d => Inst::Arithmetic(ArithmeticMode::SubWithBorrow, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x1e => Inst::Push16(DataLocation16::Reg(Reg::DS)),
 			0x1f => Inst::Pop16(DataLocation16::Reg(Reg::DS)),
+			0x20 ... 0x25 => Inst::Arithmetic(ArithmeticMode::And, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x26 => {
 				self.override_default_segment = Some(Reg::ES);
 				let inst = self.parse_instruction();
@@ -1186,7 +1231,7 @@ impl Machine8086 {
 			}
 			0xce => {
 				// INTO calls the overflow exception, which is #4
-				Inst::Interrupt(4)
+				Inst::InterruptIf(4, Flag::Overflow)
 			}
 			0xd0 => {
 				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
@@ -1208,6 +1253,9 @@ impl Machine8086 {
 				let shift_mode = ShiftMode::from_u16(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Reg(Reg::CX, RegHalf::Low), target: DataLocation::Size16(destination), mode: shift_mode}
 			}
+			0xd5 => {
+				let division_base = self.read_ip_u8();
+			}
 			// LOOP
 			0xe2 => {
 				let offset = treat_u8_as_i8(self.read_ip_u8()) as i32;
@@ -1228,6 +1276,11 @@ impl Machine8086 {
 			0xeb => {
 				let offset = treat_u8_as_i8(self.read_ip_u8()) as i32;
 				Inst::Jump{condition: None, offset}
+			}
+			0xf0 => {
+				// LOCK: This is supposed to set the LOCK pin on the CPU to ON for the duration of
+				// the next instruction's execution.
+ 				Inst::NoOp
 			}
 			// REPZ
 			0xf3 => Inst::RepeatNextRegTimes{reg: Reg::CX, until_zero_flag: Some(true)},
@@ -1264,7 +1317,7 @@ impl Machine8086 {
 			}
 			_ => {
 				//println!("{}", String::from_utf8_lossy(&self.memory));
-				panic!("Unknown opcode: 0x{:02x}", opcode);
+				panic!("Unknown opcode: 0x{:02x} (Parsing instruction #{})", opcode, self.number_of_parsed_instructions);
 			}
 		}
 	}
@@ -1577,7 +1630,7 @@ impl Machine8086 {
 			}
 			Inst::RepeatNextRegTimes{reg, until_zero_flag} => {
 				let repeat_inst = self.parse_instruction();
-				dbg!(self.get_reg_u16(reg));
+				//dbg!(self.get_reg_u16(reg));
 				while self.get_reg_u16(reg) != 0 {
 					// TODO: Service pending interrupts
 					self.apply_instruction(&repeat_inst);
@@ -1677,6 +1730,11 @@ impl Machine8086 {
 			Inst::Interrupt(interrupt_index) => {
 				self.interrupt(interrupt_index);
 			}
+			Inst::InterruptIf(interrupt_index, flag) => {
+				if self.get_flag(flag) {
+					self.interrupt(interrupt_index);
+				}
+			}
 			Inst::Halt => {
 				self.halted = true;
 			}
@@ -1735,6 +1793,10 @@ impl EventHandler for DosEventHandler {
 				// Non-maskable interrupt
 				panic!("Memory corruption error, apparently...");
 			}
+			0x04 => {
+				// Overflow
+				panic!("Overflow");
+			}
 			
 			// This is the DOS interrupt.
 			// http://spike.scu.edu.au/~barry/interrupts.html
@@ -1743,6 +1805,7 @@ impl EventHandler for DosEventHandler {
 				println!("DOS Interrupt: 0x{:x}", dos_int);
 				match dos_int {
 					0x25 => {
+						// Get ES:BX and store it as an entry of the interrupt vector/table (as the IP:CS).
 						let entry_addr = machine.get_reg_u8(Reg::AX, RegHalf::Low) as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
 						let interrupt_ip = machine.get_reg_u16(Reg::DX);
 						let interrupt_cs = machine.get_reg_u16(Reg::DS);
@@ -1774,6 +1837,7 @@ impl EventHandler for DosEventHandler {
 // Super useful: http://www.mlsite.net/8086/
 // https://en.wikibooks.org/wiki/X86_Assembly/Machine_Language_Conversion#Mod_/_Reg_/_R/M_tables
 // https://www.felixcloutier.com/x86/rcl:rcr:rol:ror
+// https://sites.google.com/site/microprocessorsbits/processor-control-instructions/lock
 
 fn main() {
     let mut file = std::fs::File::open("ZZT.EXE").unwrap();
