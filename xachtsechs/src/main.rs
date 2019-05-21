@@ -449,6 +449,12 @@ enum ShiftMode {
 	ShiftRightArithmethic,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum AdjustMode {
+	Addition,
+	Subtraction,
+}
+
 // https://en.wikibooks.org/wiki/X86_Assembly/Machine_Language_Conversion#Mod_/_Reg_/_R/M_tables
 // MOD (2 bits): Register mode
 // REG (3 bits): Register
@@ -519,6 +525,8 @@ enum Inst {
 	NoOp,
 	Push16(DataLocation16),
 	Pop16(DataLocation16),
+	PushAllGeneralPurposeRegisters,
+	PopAllGeneralPurposeRegisters,
 	Mov(SourceDestination),
 	Swap(SourceDestination),
 	/// Save as Mov, but increments the Reg by 1 or 2 for 8 and 16 bit SourceDestinations,
@@ -535,6 +543,11 @@ enum Inst {
 	Inc(DataLocation),
 	Dec(DataLocation),
 	Rotate{by: DataLocation8, target: DataLocation, mode: ShiftMode},
+	// If you have a register with two bytes [5, 6] and you pass 10 as the base, this will set the
+	// value of the register to 56, ie. 0b00111000.
+	CombineBytesAsNumberWithBase(Reg, u8),
+	AsciiAdjustAfter(Reg, AdjustMode),
+	DecimalAdjustAfter(Reg, RegHalf, AdjustMode),
 	//DecBy16(DataLocation16, u16),
 	//IncBy16(DataLocation16, u16),
 	SetFlag(Flag, bool),
@@ -1011,11 +1024,12 @@ impl Machine8086 {
 		let opcode = self.read_ip_u8();
 		// TODO: 697514/0xa1
 		if self.number_of_parsed_instructions > 0{//697000 {
-			//println!("{:?}", self.registers);
-			//println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+			println!("{:?}", self.registers);
+			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
 		// 673096
+		// TODO: 0xc4 is broken (697695)
 		/*if self.number_of_parsed_instructions > 697516 {//697762 {
 			panic!();
 		}*/
@@ -1046,6 +1060,8 @@ impl Machine8086 {
 				self.override_default_segment = None;
 				inst
 			}
+			// DAA
+			0x27 => Inst::DecimalAdjustAfter(Reg::AX, RegHalf::Low, AdjustMode::Addition),
 			0x28 ... 0x2d => Inst::Arithmetic(ArithmeticMode::Sub, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x2e => {
 				self.override_default_segment = Some(Reg::CS);
@@ -1053,6 +1069,7 @@ impl Machine8086 {
 				self.override_default_segment = None;
 				inst
 			}
+			0x2f => Inst::DecimalAdjustAfter(Reg::AX, RegHalf::Low, AdjustMode::Subtraction),
 			0x30 ... 0x35 => Inst::Arithmetic(ArithmeticMode::Xor, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x36 => {
 				self.override_default_segment = Some(Reg::SS);
@@ -1060,6 +1077,7 @@ impl Machine8086 {
 				self.override_default_segment = None;
 				inst
 			}
+			0x37 => Inst::AsciiAdjustAfter(Reg::AX, AdjustMode::Addition),
 			0x38 ... 0x3d => Inst::Arithmetic(ArithmeticMode::Cmp, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x3c => {
 				let imm = self.read_ip_u8();
@@ -1068,6 +1086,12 @@ impl Machine8086 {
 			0x3d => {
 				let imm = self.read_ip_u16();
 				Inst::Arithmetic(ArithmeticMode::Cmp, SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Immediate(imm)))
+			}
+			0x3e => {
+				self.override_default_segment = Some(Reg::DS);
+				let inst = self.parse_instruction();
+				self.override_default_segment = None;
+				inst
 			}
 			0x40 ... 0x47 => {
 				let reg = Reg::reg16((opcode & 0b111) as usize).unwrap();
@@ -1087,6 +1111,9 @@ impl Machine8086 {
 				let reg = Reg::reg16((opcode & 0b111) as usize).unwrap();
 				Inst::Pop16(DataLocation16::Reg(reg))
 			}
+			0x60 => Inst::PushAllGeneralPurposeRegisters,
+			0x61 => Inst::PopAllGeneralPurposeRegisters,
+			//0x62 => 
 			0x70 ... 0x7f => {
 				let double_condition = opcode - 0x70;
 				let condition_type = JumpConditionType::from_u8(double_condition >> 1).unwrap();
@@ -1136,7 +1163,11 @@ impl Machine8086 {
 				let ip = self.read_ip_u16();
 				let cs = self.read_ip_u16();
 				Inst::CallAbsolute{ip, cs}
-			},
+			}
+			// POPF
+			0x9d => {
+				Inst::Pop16(DataLocation16::Reg(Reg::Flags))
+			}
 			// MOV (moffs16 -> AX)
 			0xa1 => {
 				// TODO: Broken at 697514
@@ -1159,16 +1190,16 @@ impl Machine8086 {
 			// MOVSB 
 			// "string" means that it increments (or decrements if the direction flag is set) the
 			// memory address register(s) after doing an operation.
-			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
-			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
 			// STOSB
-			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
+			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// STOSW
-			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
+			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// LODSB
-			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
+			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
 			// LODSW
-			0xad => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: Reg::DS, address16: Address16::Reg(Reg::SI)}, DataLocation16::Reg(Reg::AX)), Reg::SI, None),
+			0xad => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Reg(Reg::AX)), Reg::SI, None),
 			0xb0 ... 0xb7 => {
 				let (reg, reg_half) = Reg::reg8((opcode & 0b111) as usize).unwrap();
 				let imm = self.read_ip_u8();
@@ -1253,8 +1284,10 @@ impl Machine8086 {
 				let shift_mode = ShiftMode::from_u16(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Reg(Reg::CX, RegHalf::Low), target: DataLocation::Size16(destination), mode: shift_mode}
 			}
+			// AAD/ADX
 			0xd5 => {
-				let division_base = self.read_ip_u8();
+				let base = self.read_ip_u8();
+				Inst::CombineBytesAsNumberWithBase(Reg::AX, base)
 			}
 			// LOOP
 			0xe2 => {
@@ -1522,6 +1555,27 @@ impl Machine8086 {
 				let value = self.pop_u16();
 				self.set_data_u16(location, value);
 			}
+			Inst::PushAllGeneralPurposeRegisters => {
+				let start_sp = self.get_reg_u16(Reg::SP);
+				self.push_u16(self.get_reg_u16(Reg::AX));
+				self.push_u16(self.get_reg_u16(Reg::CX));
+				self.push_u16(self.get_reg_u16(Reg::DX));
+				self.push_u16(self.get_reg_u16(Reg::BX));
+				self.push_u16(start_sp);
+				self.push_u16(self.get_reg_u16(Reg::BP));
+				self.push_u16(self.get_reg_u16(Reg::SI));
+				self.push_u16(self.get_reg_u16(Reg::DI));
+			}
+			Inst::PopAllGeneralPurposeRegisters => {
+				self.registers[Reg::DI as usize] = self.pop_u16();
+				self.registers[Reg::SI as usize] = self.pop_u16();
+				self.registers[Reg::BP as usize] = self.pop_u16();
+				let _sp = self.pop_u16();
+				self.registers[Reg::BX as usize] = self.pop_u16();
+				self.registers[Reg::DX as usize] = self.pop_u16();
+				self.registers[Reg::CX as usize] = self.pop_u16();
+				self.registers[Reg::AX as usize] = self.pop_u16();
+			}
 			Inst::Mov(SourceDestination::Size8(ref source, ref destination)) => {
 				let value = self.get_data_u8(&source);
 				self.set_data_u8(&destination, value);
@@ -1618,6 +1672,64 @@ impl Machine8086 {
 				let value = self.get_data_u16(&target);
 				let new_value = self.apply_rotate_inst(rotate_amount, value, mode);
 				self.set_data_u16(&target, new_value);
+			}
+			Inst::CombineBytesAsNumberWithBase(reg, base) => {
+				let low_byte = self.get_reg_u8(reg, RegHalf::Low);
+				let high_byte = self.get_reg_u8(reg, RegHalf::High);
+				let new_value = (low_byte + (high_byte * base)) as u16;
+				self.set_reg_u16(reg, new_value);
+			}
+			Inst::AsciiAdjustAfter(reg, mode) => {
+				if self.get_reg_u8(reg, RegHalf::Low) & 0x0f > 9 || self.get_flag(Flag::Adjust) {
+					match mode {
+						AdjustMode::Addition => {
+							self.set_reg_u16(reg, self.get_reg_u16(reg).wrapping_add(0x106));
+						}
+						AdjustMode::Subtraction => {
+							self.set_reg_u16(reg, self.get_reg_u16(reg).wrapping_sub(6));
+							self.set_reg_u8(reg, RegHalf::High, self.get_reg_u8(reg, RegHalf::High).wrapping_sub(1));
+						}
+					}
+					self.set_flag(Flag::Adjust, true);
+					self.set_flag(Flag::Carry, true);
+				} else {
+					self.set_flag(Flag::Adjust, false);
+					self.set_flag(Flag::Carry, false);
+				}
+				self.set_reg_u8(reg, RegHalf::Low, self.get_reg_u8(reg, RegHalf::Low) & 0x0f);
+			}
+			Inst::DecimalAdjustAfter(reg, reg_half, mode) => {
+				let old_value = self.get_reg_u8(reg, reg_half);
+				let old_carry = self.get_flag(Flag::Carry);
+				self.set_flag(Flag::Carry, false);
+				if old_value & 0x0f > 9 || self.get_flag(Flag::Adjust) {
+					match mode {
+						AdjustMode::Addition => {
+							let new_value = old_value.wrapping_add(6);
+							self.set_reg_u8(reg, reg_half, new_value);
+							let new_carry = old_carry || new_value < 6;
+							self.set_flag(Flag::Carry, new_carry);
+						}
+						AdjustMode::Subtraction => {
+							let new_value = old_value.wrapping_sub(6);
+							self.set_reg_u8(reg, reg_half, new_value);
+							let new_carry = old_carry || old_value < 6;
+							self.set_flag(Flag::Carry, new_carry);
+						}
+					}
+					self.set_flag(Flag::Adjust, true);
+				} else {
+					self.set_flag(Flag::Adjust, false);
+				}
+				if old_value > 0x99 || old_carry {
+					self.set_reg_u8(reg, reg_half, match mode {
+						AdjustMode::Addition => old_value.wrapping_add(0x60),
+						AdjustMode::Subtraction => old_value.wrapping_sub(0x60),
+					});
+					self.set_flag(Flag::Carry, true);
+				} else {
+					self.set_flag(Flag::Carry, false);
+				}
 			}
 			/*Inst::DecBy16(location, amount) => {
 				self.sub_from_data_u16(&location, amount);
@@ -1797,6 +1909,11 @@ impl EventHandler for DosEventHandler {
 				// Overflow
 				panic!("Overflow");
 			}
+			0x14 => {
+				// Serial port services
+				let serial_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
+				println!("Serial port interrupt: {}", serial_int);
+			}
 			
 			// This is the DOS interrupt.
 			// http://spike.scu.edu.au/~barry/interrupts.html
@@ -1817,8 +1934,8 @@ impl EventHandler for DosEventHandler {
 						let entry_addr = machine.get_reg_u8(Reg::AX, RegHalf::Low) as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
 						let interrupt_ip = machine.peek_u16(entry_addr);
 						let interrupt_cs = machine.peek_u16(entry_addr + 2);
-						machine.set_reg_u16(Reg::ES, interrupt_ip);
-						machine.set_reg_u16(Reg::BX, interrupt_cs);
+						machine.set_reg_u16(Reg::BX, interrupt_ip);
+						machine.set_reg_u16(Reg::ES, interrupt_cs);
 					}
 					_ => {panic!();}
 				}
