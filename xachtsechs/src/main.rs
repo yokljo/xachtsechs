@@ -141,6 +141,9 @@ const BIOS_CURSOR_POSITION: [DataLocation16; 8] = [
 ];
 const BIOS_ACTIVE_VIDEO_PAGE: DataLocation8 = bios_off_u8(0x62);
 const BIOS_VIDEO_IO_PORT_ADDRESS: DataLocation16 = bios_off_u16(0x63);
+const BIOS_SYSTEM_TIMER_COUNTER_ADDR_U32: u32 = BIOS_START + 0x6c;
+const BIOS_SYSTEM_TIMER_COUNTER_LOW: DataLocation16 = bios_off_u16(0x6c);
+const BIOS_SYSTEM_TIMER_COUNTER_HIGH: DataLocation16 = bios_off_u16(0x6e);
 const BIOS_TEXT_ROW_COUNT: DataLocation16 = bios_off_u16(0x84);
 const BIOS_CHAR_HEIGHT: DataLocation16 = bios_off_u16(0x85);
 
@@ -458,6 +461,14 @@ enum ArithmeticMode {
 	Cmp,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum ScalarMode {
+	Mul,
+	SignedMul,
+	Div,
+	SignedDiv,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, FromPrimitive)]
 #[repr(u8)]
 enum ShiftMode {
@@ -567,6 +578,14 @@ enum Inst {
 	Load32{seg: Reg, address16: Address16, out_reg_h: Reg, out_reg_l: Reg},
 	
 	Arithmetic(ArithmeticMode, SourceDestination),
+	/// Use the 16-bit number `value_quot_rem` and scale it by the value in `by`,
+	/// then put the quotient in the low byte of `value_quot_rem`, and the remainder in the high
+	/// half of `value_quot_rem`.
+	ScalarOperation8{mode: ScalarMode, value_quot_rem: Reg, by: DataLocation8},
+	/// Use the 32-bit number `value_high_rem:value_low_quot` and scale it by the value in `by`,
+	/// then put the quotient in value_low_quot, and the remainder in value_high_rem.
+	ScalarOperation16{mode: ScalarMode, value_low_quot: Reg, value_high_rem: Reg, by: DataLocation16},
+	Negate(DataLocation),
 	Inc(DataLocation),
 	Dec(DataLocation),
 	Rotate{by: DataLocation8, target: DataLocation, mode: ShiftMode},
@@ -1051,11 +1070,23 @@ impl Machine8086 {
 			_ => panic!("Attempted to call read_arithmetic_source_destination with bad opcode: 0x{:x}", opcode)
 		}
 	}
+	
+	fn get_standard_scalar_mode(&self, index: u8) -> ScalarMode {
+		match index {
+			4 => ScalarMode::Mul,
+			5 => ScalarMode::SignedMul,
+			6 => ScalarMode::Div,
+			7 => ScalarMode::SignedDiv,
+			_ => panic!("Non-standard scalar mode: {}", index)
+		}
+	}
 
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
+		
+		// TODO 698476 is borken 0x3a
 		// TODO: 697514/0xa1
-		if self.number_of_parsed_instructions > 697000 {
+		if self.number_of_parsed_instructions >= 698000 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
@@ -1110,6 +1141,7 @@ impl Machine8086 {
 				inst
 			}
 			0x37 => Inst::AsciiAdjustAfter(Reg::AX, AdjustMode::Addition),
+			// TODO: 0x3a breaks on -787969-, no 698476
 			0x38 ... 0x3d => Inst::Arithmetic(ArithmeticMode::Cmp, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x3c => {
 				let imm = self.read_ip_u8();
@@ -1145,7 +1177,6 @@ impl Machine8086 {
 			}
 			0x60 => Inst::PushAllGeneralPurposeRegisters,
 			0x61 => Inst::PopAllGeneralPurposeRegisters,
-			//0x62 => 
 			0x70 ... 0x7f => {
 				let double_condition = opcode - 0x70;
 				let condition_type = JumpConditionType::from_u8(double_condition >> 1).unwrap();
@@ -1175,7 +1206,12 @@ impl Machine8086 {
 				//println!("0x83 {}, {}", raw_imm, imm);
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size16(DataLocation16::Immediate(imm as u16), destination))
 			}
-			0x88 ... 0x8b => Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS)),
+			// XCHG - swap register/memory with register
+			// TODO: Verify operation
+			0x86 | 0x87 => Inst::Swap(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS)),
+			0x88 ... 0x8b => {
+				Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS))
+			}
 			0x8c => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Seg, Reg::DS, None)),
 			// LEA
 			0x8d => {
@@ -1186,7 +1222,11 @@ impl Machine8086 {
 					panic!("Expected Memory as the source {:?}", source_destination);
 				}
 			}
+			// MOV
+			// https://www.felixcloutier.com/x86/mov
+			// The SS register is weird.
 			0x8e => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Seg, Reg::DS, None)),
+			// XCHG
 			0x90 ... 0x97 => {
 				let reg = Reg::reg16((opcode & 0b111) as usize).unwrap();
 				Inst::Swap(SourceDestination::Size16(DataLocation16::Reg(reg), DataLocation16::Reg(Reg::AX)))
@@ -1203,7 +1243,6 @@ impl Machine8086 {
 			}
 			// MOV (moffs16 -> AX)
 			0xa1 => {
-				// TODO: Broken at 697514
 				let offset = self.read_ip_u16();
 				let addr = self.get_seg_offset(self.resolve_default_segment(Reg::DS), offset) as usize;
 				println!("{:?}", addr);
@@ -1276,12 +1315,13 @@ impl Machine8086 {
 				}
 			}
 			0xc6 => {
-				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None).split();
+				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Source, ModRmRegMode::Reg, Reg::DS, None).split();
 				let imm = self.read_ip_u8();
 				Inst::Mov(destination.with_immediate_source(imm as u16))
 			}
 			0xc7 => {
-				let (_, destination) = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None).split();
+				// TODO: 0xc7  698084
+				let (_, destination) = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Reg, Reg::DS, None).split();
 				let imm = self.read_ip_u16();
 				Inst::Mov(destination.with_immediate_source(imm))
 			}
@@ -1291,7 +1331,6 @@ impl Machine8086 {
 			}
 			0xcb => Inst::RetAbsolute{extra_pop: 0},
 			0xcd => {
-				// TODO: 697998 is borken
 				let interrupt_index = self.read_ip_u8();
 				Inst::Interrupt(interrupt_index)
 			}
@@ -1360,7 +1399,21 @@ impl Machine8086 {
 						let imm = self.read_ip_u8();
 						Inst::BitwiseCompareWithAnd(SourceDestination::Size8(DataLocation8::Immediate(imm), destination))
 					}
+					2 => Inst::Negate(DataLocation::Size8(destination)),
 					_ => panic!("Unknown 0xf6 mode: 0x{:x}", inst_index)
+				}
+			}
+			0xf7 => {
+				// TODO: Borken on #698060.
+				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				match inst_index {
+					0 => {
+						let imm = self.read_ip_u16();
+						Inst::BitwiseCompareWithAnd(SourceDestination::Size16(DataLocation16::Immediate(imm), destination))
+					}
+					2 => Inst::Negate(DataLocation::Size16(destination)),
+					4...7 => Inst::ScalarOperation16{mode: self.get_standard_scalar_mode(inst_index as u8), value_low_quot: Reg::AX, value_high_rem: Reg::DX, by: destination},
+					_ => panic!("Unknown 0xf7 mode: 0x{:x}", inst_index)
 				}
 			}
 			0xf8 => Inst::SetFlag(Flag::Carry, false),
@@ -1640,6 +1693,13 @@ impl Machine8086 {
 			Inst::Mov(SourceDestination::Size16(ref source, ref destination)) => {
 				let value = self.get_data_u16(&source);
 				self.set_data_u16(&destination, value);
+				if let DataLocation16::Reg(Reg::SS) = destination {
+					// https://www.felixcloutier.com/x86/mov
+					// Loading the SS register with MOV skips interrupts, so just manually execute another instruction to force them to be skipped.
+					// TODO: Move this into a machine state.
+					let next_inst = self.parse_instruction();
+					self.apply_instruction(&next_inst);
+				}
 			}
 			Inst::Load32{seg, ref address16, out_reg_h, out_reg_l} => {
 				let addr = self.get_seg_offset(seg, self.calculate_effective_address16(&address16));
@@ -1654,9 +1714,11 @@ impl Machine8086 {
 				self.set_data_u8(&left, value_right);
 				self.set_data_u8(&right, value_left);
 			}
-			Inst::Swap(SourceDestination::Size16(ref source, ref destination)) => {
-				let value = self.get_data_u16(&source);
-				self.set_data_u16(&destination, value);
+			Inst::Swap(SourceDestination::Size16(ref left, ref right)) => {
+				let value_left = self.get_data_u16(&left);
+				let value_right = self.get_data_u16(&right);
+				self.set_data_u16(&left, value_right);
+				self.set_data_u16(&right, value_left);
 			}
 			Inst::MovAndIncrement(SourceDestination::Size8(ref source, ref destination), inc_reg, inc_reg2) => {
 				let value = self.get_data_u8(&source);
@@ -1693,6 +1755,41 @@ impl Machine8086 {
 				if let Some(result_value) = self.apply_arithmetic_inst(value1, value2, mode, true) {
 					self.set_data_u16(&destination, result_value);
 				}
+			}
+			Inst::ScalarOperation8{mode, value_quot_rem, ref by} => {
+				unimplemented!();
+			}
+			Inst::ScalarOperation16{mode, value_low_quot, value_high_rem, ref by} => {
+				match mode {
+					ScalarMode::Div => {
+						let value = self.get_reg_u16(value_low_quot) as u32 + ((self.get_reg_u16(value_high_rem) as u32) << 16);
+						let divisor = self.get_data_u16(by);
+						if divisor == 0 {
+							// Divide by zero
+							self.interrupt_on_next_step(0);
+						} else {
+							let quotient = value / (divisor as u32);
+							let quotient16 = (quotient & 0xffff) as u16;
+							let remainder = (value % (divisor as u32)) as u16;
+							if quotient != quotient16 as u32 {
+								// Result doesn't fit
+								self.interrupt_on_next_step(0);
+							} else {
+								self.set_reg_u16(value_low_quot, quotient16);
+								self.set_reg_u16(value_high_rem, remainder);
+							}
+						}
+					}
+					_ => panic!("Unimplemented: {:?}", mode)
+				}
+			}
+			Inst::Negate(DataLocation::Size8(ref target)) => {
+				let value = self.get_data_u8(&target);
+				self.set_data_u8(&target, !value);
+			}
+			Inst::Negate(DataLocation::Size16(ref target)) => {
+				let value = self.get_data_u16(&target);
+				self.set_data_u16(&target, !value);
 			}
 			Inst::Inc(DataLocation::Size8(ref target)) => {
 				let value = self.get_data_u8(&target);
@@ -1972,9 +2069,9 @@ impl Machine8086 {
 		
 		if !handled_interrupt {
 			let inst = self.parse_instruction();
-			if self.number_of_parsed_instructions > 697000 {
-				//println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
-				//panic!();
+			if self.number_of_parsed_instructions > 1000000 {
+				println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
+				panic!();
 				//println!("{:?}", inst);
 			}
 			self.apply_instruction(&inst);
@@ -2062,16 +2159,24 @@ impl DosEventHandler {
 		match video_int {
 			0x08 => {
 				// Read char and attributes at cursor position
-				machine.set_reg_u8(Reg::BX, RegHalf::High, 0);
-				let bh = machine.get_reg_u8(Reg::BX, RegHalf::High);
+				/*let bh = machine.get_reg_u8(Reg::BX, RegHalf::High);
+				let bl = machine.get_reg_u8(Reg::BX, RegHalf::Low);
 				let video_page = if bh == 0xff { machine.get_data_u8(&BIOS_ACTIVE_VIDEO_PAGE) } else { bh };
 				let (cursor_x, cursor_y) = split_u16_high_low(machine.get_data_u16(&BIOS_CURSOR_POSITION[video_page as usize]));
 				let page_bytes = machine.get_data_u16(&BIOS_TEXT_PAGE_BYTES);
 				let column_count = machine.get_data_u16(&BIOS_TEXT_COLUMN_COUNT);
 				let bytes_per_char = 2;
-				let addr = self.video_mode.text_address + (video_page as u32 * page_bytes as u32) + ((cursor_y as u32 * column_count as u32) + cursor_x as u32) * bytes_per_char;
+				let addr = self.video_mode.text_address + (video_page as u32 * page_bytes as u32) + (((cursor_y as u32 * column_count as u32) + cursor_x as u32) * bytes_per_char);
+				dbg!((addr, video_page, column_count, cursor_x, cursor_y, bl, bh));
 				let char_colour_attrs = machine.peek_u16(addr);
-				machine.set_reg_u16(Reg::AX, char_colour_attrs);
+				machine.set_reg_u16(Reg::AX, char_colour_attrs);*/
+				
+				// Copying ZETA to test that it actually works:
+				let bh = machine.get_reg_u8(Reg::BX, RegHalf::High);
+				let bl = machine.get_reg_u8(Reg::BX, RegHalf::Low);
+				let addr = self.video_mode.text_address + (((bl as u32 * 80 as u32) + bh as u32) * 2);
+				machine.set_reg_u8(Reg::AX, RegHalf::Low, machine.peek_u8(addr));
+				machine.set_reg_u8(Reg::BX, RegHalf::High, machine.peek_u8(addr + 1));
 			}
 			0x0f => {
 				// Get current video mode
@@ -2088,6 +2193,9 @@ impl DosEventHandler {
 				match func11 {
 					0x30 => {
 						// TODO: Get font information
+						
+						// Copying ZETA:
+						machine.set_flag(Flag::Carry, true);
 					}
 					_ => panic!("Unknown video 0x11 func: 0x{:x}", func11)
 				}
@@ -2111,6 +2219,22 @@ impl EventHandler for DosEventHandler {
 				// Overflow
 				panic!("Overflow");
 			}
+			0x08 => {
+				// Timer interrupt. This is supposed to be injected by an external source exactly
+				// 18.2 times per second.
+				// TODO
+				let timer_low = machine.get_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_LOW);
+				let timer_high = machine.get_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_HIGH);
+				let timer = timer_low as u32 + ((timer_high as u32) << 16);
+				let new_timer = timer.wrapping_add(1);
+				println!("Time: {}", new_timer);
+				let new_timer_low = (new_timer & 0xffff) as u16;
+				let new_timer_high = ((new_timer >> 16) & 0xffff) as u16;
+				machine.set_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_LOW, new_timer_low);
+				machine.set_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_HIGH, new_timer_high);
+				// Emit user timer tick.
+				machine.interrupt_on_next_step(0x1c);
+			}
 			0x10 => {
 				self.handle_interrupt_10h(machine);
 			}
@@ -2118,6 +2242,9 @@ impl EventHandler for DosEventHandler {
 				// Serial port services
 				let serial_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
 				println!("Serial port interrupt: {}", serial_int);
+			}
+			0x1c => {
+				// User timer tick, emitted by 0x08.
 			}
 			
 			// This is the DOS interrupt.
@@ -2186,7 +2313,15 @@ fn main() {
 		video_mode: MachineType::EGA.lookup_video_mode(3).unwrap(),
     };
     event_handler.init_machine(&mut machine);
+    let mut step_count = 0;
     loop {
+		if step_count % 20 == 0 {
+			//println!("interrupt 0x08");
+			machine.interrupt_on_next_step(0x08);
+		}
+		//println!("before");
 		machine.step(&mut event_handler);
+		//println!("after");
+		step_count += 1;
 	}
 }
