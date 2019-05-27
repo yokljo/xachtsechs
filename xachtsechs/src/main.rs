@@ -325,11 +325,19 @@ fn treat_u16_as_i16(value: u16) -> i16 {
 	unsafe { std::mem::transmute(value) }
 }
 
+fn treat_u32_as_i32(value: u32) -> i32 {
+	unsafe { std::mem::transmute(value) }
+}
+
 fn treat_i8_as_u8(value: i8) -> u8 {
 	unsafe { std::mem::transmute(value) }
 }
 
 fn treat_i16_as_u16(value: i16) -> u16 {
+	unsafe { std::mem::transmute(value) }
+}
+
+fn treat_i32_as_u32(value: i32) -> u32 {
 	unsafe { std::mem::transmute(value) }
 }
 
@@ -378,6 +386,15 @@ enum DisplacementOrigin {
 	DI,
 	BP,
 	BX,
+}
+
+impl DisplacementOrigin {
+	fn default_segment(self) -> Reg {
+		match self {
+			DisplacementOrigin::BP_SI | DisplacementOrigin::BP_DI | DisplacementOrigin::BP => Reg::SS,
+			_ => Reg::DS,
+		}
+	}
 }
 
 // https://www.daenotes.com/electronics/digital-electronics/8086-8088-microprocessor
@@ -563,6 +580,9 @@ enum Inst {
 	NoOp,
 	Push16(DataLocation16),
 	Pop16(DataLocation16),
+	// Popping into the flags register has some special behaviour.
+	// See https://www.felixcloutier.com/x86/popf:popfd:popfq
+	PopFlags,
 	PushAllGeneralPurposeRegisters,
 	PopAllGeneralPurposeRegisters,
 	Mov(SourceDestination),
@@ -586,6 +606,7 @@ enum Inst {
 	/// then put the quotient in value_low_quot, and the remainder in value_high_rem.
 	ScalarOperation16{mode: ScalarMode, value_low_quot: Reg, value_high_rem: Reg, by: DataLocation16},
 	Negate(DataLocation),
+	NegateSigned(DataLocation),
 	Inc(DataLocation),
 	Dec(DataLocation),
 	Rotate{by: DataLocation8, target: DataLocation, mode: ShiftMode},
@@ -598,6 +619,7 @@ enum Inst {
 	//DecBy16(DataLocation16, u16),
 	//IncBy16(DataLocation16, u16),
 	SetFlag(Flag, bool),
+	InvertFlag(Flag),
 	RepeatNextRegTimes{reg: Reg, until_zero_flag: Option<bool>},
 	Call(i32),
 	// After popping the IP from the stack, it will pop extra_pop more bytes from the stack. These
@@ -616,6 +638,10 @@ enum Inst {
 	Interrupt(u8),
 	InterruptIf(u8, Flag),
 	Halt,
+	// Get the lower half of the register and sign-extend it to 16 bits and put that value back in
+	// the register.
+	SignExtend8To16{source: DataLocation8, destination: DataLocation16},
+	SignExtend16To32{source: DataLocation16, destination_high: DataLocation16, destination_low: DataLocation16},
 	// Override the default segment for the next instruction.
 	// https://www.quora.com/Why-is-a-segment-override-prefix-used-with-an-example-in-8086-microprocessor
 	//OverrideNextDefaultSegment(Reg)
@@ -920,16 +946,12 @@ impl Machine8086 {
 		}
 	}
 	
-	fn read_modrm_source_destination(&mut self, opsize: OpSize, opdir: OpDirection, reg_mode: ModRmRegMode, default_segment: Reg, override_mod: Option<u8>) -> SourceDestination {
+	fn read_modrm_source_destination(&mut self, opsize: OpSize, opdir: OpDirection, reg_mode: ModRmRegMode) -> SourceDestination {
 		let modrm_code = self.read_ip_u8();
-		//println!("Modrm code: {:b}", modrm_code);
+		//println!("Modrm code: {:08b}", modrm_code);
 		let rm_code = modrm_code & 0b00000111;
 		let reg_code = (modrm_code & 0b00111000) >> 3;
-		let mod_code = if let Some(override_mod) = override_mod {
-			override_mod
-		} else {
-			(modrm_code & 0b11000000) >> 6
-		};
+		let mod_code = (modrm_code & 0b11000000) >> 6;
 		
 		let mut first: DataLocation = match reg_mode {
 			ModRmRegMode::Reg => match opsize {
@@ -937,7 +959,10 @@ impl Machine8086 {
 					let (reg, half) = Reg::reg8(reg_code as usize).unwrap();
 					DataLocation::Size8(DataLocation8::Reg(reg, half))
 				}
-				OpSize::Size16 => DataLocation::Size16(DataLocation16::Reg(Reg::reg16(reg_code as usize).unwrap())),
+				OpSize::Size16 => {
+					let reg = Reg::reg16(reg_code as usize).unwrap();
+					DataLocation::Size16(DataLocation16::Reg(reg))
+				}
 			}
 			ModRmRegMode::Seg => match opsize {
 				OpSize::Size8 => panic!("Reg cannot be seg in 8 bit mode"),
@@ -970,7 +995,7 @@ impl Machine8086 {
 				if rm_code == 0b110 {
 					let addr = self.read_ip_u16();
 					// Displacements are relative to the data segment (DS)
-					let seg = self.resolve_default_segment(default_segment);
+					let seg = self.resolve_default_segment(Reg::DS);
 					second = Some(match opsize {
 						OpSize::Size8 => DataLocation::Size8(DataLocation8::Memory{seg, address16: Address16::Immediate(addr)}),
 						OpSize::Size16 => DataLocation::Size16(DataLocation16::Memory{seg, address16: Address16::Immediate(addr)}),
@@ -1002,7 +1027,7 @@ impl Machine8086 {
 		}
 		
 		if let Some(offset) = displacement {
-			let seg = self.resolve_default_segment(default_segment);
+			let seg = self.resolve_default_segment(displacement_origin.default_segment());
 			second = Some(match opsize {
 				OpSize::Size8 => DataLocation::Size8(DataLocation8::Memory{seg, address16: Address16::DisplacementRel(displacement_origin, offset)}),
 				OpSize::Size16 => DataLocation::Size16(DataLocation16::Memory{seg, address16: Address16::DisplacementRel(displacement_origin, offset)}),
@@ -1026,8 +1051,8 @@ impl Machine8086 {
 		}
 	}
 	
-	fn read_modrm_with_immediate_reg_u8(&mut self, default_segment: Reg) -> (u8, DataLocation8) {
-		let source_destination = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Source, ModRmRegMode::Imm, default_segment, None);
+	fn read_modrm_with_immediate_reg_u8(&mut self) -> (u8, DataLocation8) {
+		let source_destination = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Source, ModRmRegMode::Imm);
 		let (imm, destination) = match source_destination {
 			SourceDestination::Size8(source, destination) => match source {
 				DataLocation8::Immediate(imm) => (imm, destination),
@@ -1038,8 +1063,8 @@ impl Machine8086 {
 		(imm, destination)
 	}
 	
-	fn read_modrm_with_immediate_reg_u16(&mut self, default_segment: Reg, override_mod: Option<u8>) -> (u16, DataLocation16) {
-		let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Imm, default_segment, override_mod);
+	fn read_modrm_with_immediate_reg_u16(&mut self) -> (u16, DataLocation16) {
+		let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Imm);
 		let (imm, destination) = match source_destination {
 			SourceDestination::Size8(_, _) => panic!("Source was not 16 bits"),
 			SourceDestination::Size16(source, destination) => match source {
@@ -1050,15 +1075,15 @@ impl Machine8086 {
 		(imm, destination)
 	}
 	
-	fn read_standard_source_destination(&mut self, opcode: u8, reg_mode: ModRmRegMode, default_segment: Reg) -> SourceDestination {
+	fn read_standard_source_destination(&mut self, opcode: u8, reg_mode: ModRmRegMode) -> SourceDestination {
 		let opsize = if opcode & 0b01 == 0 { OpSize::Size8 } else { OpSize::Size16 };
 		let opdir = if opcode & 0b10 == 0 { OpDirection::Source } else { OpDirection::Destination };
-		self.read_modrm_source_destination(opsize, opdir, reg_mode, default_segment, None)
+		self.read_modrm_source_destination(opsize, opdir, reg_mode)
 	}
 	
 	fn read_arithmetic_source_destination_with_ax(&mut self, opcode: u8) -> SourceDestination {
 		match opcode & 0b111 {
-			0x00 ... 0x03 => self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS),
+			0x00 ... 0x03 => self.read_standard_source_destination(opcode, ModRmRegMode::Reg),
 			0x04 => {
 				let imm = self.read_ip_u8();
 				SourceDestination::Size8(DataLocation8::Immediate(imm), DataLocation8::Reg(Reg::AX, RegHalf::Low))
@@ -1084,15 +1109,11 @@ impl Machine8086 {
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		// TODO 698476 is borken 0x3a
-		// TODO: 697514/0xa1
 		if self.number_of_parsed_instructions >= 698000 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
-		// 673096
-		// TODO: 0xf3 combined with 0xab is broken (697719)
 		/*if self.number_of_parsed_instructions > 697516 {//697762 {
 			panic!();
 		}*/
@@ -1141,7 +1162,6 @@ impl Machine8086 {
 				inst
 			}
 			0x37 => Inst::AsciiAdjustAfter(Reg::AX, AdjustMode::Addition),
-			// TODO: 0x3a breaks on -787969-, no 698476
 			0x38 ... 0x3d => Inst::Arithmetic(ArithmeticMode::Cmp, self.read_arithmetic_source_destination_with_ax(opcode)),
 			0x3c => {
 				let imm = self.read_ip_u8();
@@ -1185,20 +1205,20 @@ impl Machine8086 {
 				Inst::Jump{condition: Some(JumpCondition{condition: condition_type, negate}), offset}
 			}
 			0x80 | 0x82 => {
-				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				let arithmetic_mode = ArithmeticMode::from_u8(mode_index).unwrap();
 				let imm = self.read_ip_u8();
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size8(DataLocation8::Immediate(imm), destination))
 			}
 			0x81 => {
-				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				let arithmetic_mode = ArithmeticMode::from_u16(mode_index).unwrap();
 				let imm = self.read_ip_u16();
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size16(DataLocation16::Immediate(imm), destination))
 			}
 			// 0x82: See 0x80
 			0x83 => {
-				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (mode_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				let arithmetic_mode = ArithmeticMode::from_u16(mode_index).unwrap();
 				let raw_imm = self.read_ip_u8();
 				// Read a u8 then sign-extend it to u16:
@@ -1207,15 +1227,12 @@ impl Machine8086 {
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size16(DataLocation16::Immediate(imm as u16), destination))
 			}
 			// XCHG - swap register/memory with register
-			// TODO: Verify operation
-			0x86 | 0x87 => Inst::Swap(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS)),
-			0x88 ... 0x8b => {
-				Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg, Reg::DS))
-			}
-			0x8c => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Seg, Reg::DS, None)),
+			0x86 | 0x87 => Inst::Swap(self.read_standard_source_destination(opcode, ModRmRegMode::Reg)),
+			0x88 ... 0x8b => Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg)),
+			0x8c => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Seg)),
 			// LEA
 			0x8d => {
-				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None);
+				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg);
 				if let SourceDestination::Size16(DataLocation16::Memory{address16, ..}, destination) = source_destination {
 					Inst::Mov(SourceDestination::Size16(DataLocation16::Address16(address16), destination))
 				} else {
@@ -1225,24 +1242,29 @@ impl Machine8086 {
 			// MOV
 			// https://www.felixcloutier.com/x86/mov
 			// The SS register is weird.
-			0x8e => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Seg, Reg::DS, None)),
+			0x8e => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Seg)),
 			// XCHG
 			0x90 ... 0x97 => {
 				let reg = Reg::reg16((opcode & 0b111) as usize).unwrap();
 				Inst::Swap(SourceDestination::Size16(DataLocation16::Reg(reg), DataLocation16::Reg(Reg::AX)))
 			}
+			// CBW - Convert byte to word via sign extension. Ie. get a i8 and turn it into a u16.
+			0x98 => Inst::SignExtend8To16{source: DataLocation8::Reg(Reg::AX, RegHalf::Low), destination: DataLocation16::Reg(Reg::AX)},
+			// CWD - Convert word to double.
+			0x99 => Inst::SignExtend16To32{source: DataLocation16::Reg(Reg::AX), destination_low: DataLocation16::Reg(Reg::AX), destination_high: DataLocation16::Reg(Reg::DX)},
 			// CALLF
 			0x9a => {
 				let ip = self.read_ip_u16();
 				let cs = self.read_ip_u16();
 				Inst::CallAbsolute{ip, cs}
 			}
+			// PUSHF (push flags register)
+			0x9c => Inst::Push16(DataLocation16::Reg(Reg::Flags)),
 			// POPF
-			0x9d => {
-				Inst::Pop16(DataLocation16::Reg(Reg::Flags))
-			}
+			0x9d => Inst::PopFlags,
 			// MOV (moffs16 -> AX)
 			0xa1 => {
+				// TODO: 772735
 				let offset = self.read_ip_u16();
 				let addr = self.get_seg_offset(self.resolve_default_segment(Reg::DS), offset) as usize;
 				println!("{:?}", addr);
@@ -1284,13 +1306,13 @@ impl Machine8086 {
 				Inst::Mov(SourceDestination::Size16(DataLocation16::Immediate(imm), DataLocation16::Reg(reg)))
 			}
 			0xc0 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				let shift_mode = ShiftMode::from_u8(shift_index).unwrap();
 				let imm = self.read_ip_u8();
 				Inst::Rotate{by: DataLocation8::Immediate(imm), target: DataLocation::Size8(destination), mode: shift_mode}
 			}
 			0xc1 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				let shift_mode = ShiftMode::from_u16(shift_index).unwrap();
 				let imm = self.read_ip_u8();
 				Inst::Rotate{by: DataLocation8::Immediate(imm), target: DataLocation::Size16(destination), mode: shift_mode}
@@ -1306,7 +1328,7 @@ impl Machine8086 {
 			}
 			// LES | LDS (load absolute pointer in the ES/DS segment)
 			0xc4 | 0xc5 => {
-				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg, Reg::DS, None);
+				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg);
 				if let SourceDestination::Size16(DataLocation16::Memory{seg, address16: Address16::DisplacementRel(displacement, offset)}, DataLocation16::Reg(out_reg_l)) = source_destination {
 					let out_reg_h = if opcode == 0xc4 { Reg::ES } else { Reg::DS };
 					Inst::Load32{seg, address16: Address16::DisplacementRel(displacement, offset), out_reg_h, out_reg_l}
@@ -1315,13 +1337,13 @@ impl Machine8086 {
 				}
 			}
 			0xc6 => {
-				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Source, ModRmRegMode::Reg, Reg::DS, None).split();
+				let (_, destination) = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Source, ModRmRegMode::Reg).split();
 				let imm = self.read_ip_u8();
 				Inst::Mov(destination.with_immediate_source(imm as u16))
 			}
 			0xc7 => {
 				// TODO: 0xc7  698084
-				let (_, destination) = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Reg, Reg::DS, None).split();
+				let (_, destination) = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Reg).split();
 				let imm = self.read_ip_u16();
 				Inst::Mov(destination.with_immediate_source(imm))
 			}
@@ -1339,22 +1361,22 @@ impl Machine8086 {
 				Inst::InterruptIf(4, Flag::Overflow)
 			}
 			0xd0 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				let shift_mode = ShiftMode::from_u8(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Immediate(1), target: DataLocation::Size8(destination), mode: shift_mode}
 			}
 			0xd1 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				let shift_mode = ShiftMode::from_u16(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Immediate(1), target: DataLocation::Size16(destination), mode: shift_mode}
 			}
 			0xd2 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				let shift_mode = ShiftMode::from_u8(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Reg(Reg::CX, RegHalf::Low), target: DataLocation::Size8(destination), mode: shift_mode}
 			}
 			0xd3 => {
-				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				let shift_mode = ShiftMode::from_u16(shift_index).unwrap();
 				Inst::Rotate{by: DataLocation8::Reg(Reg::CX, RegHalf::Low), target: DataLocation::Size16(destination), mode: shift_mode}
 			}
@@ -1392,26 +1414,33 @@ impl Machine8086 {
 			// REPZ
 			0xf3 => Inst::RepeatNextRegTimes{reg: Reg::CX, until_zero_flag: Some(true)},
 			0xf4 => Inst::Halt,
+			// CMC (compliment (flip the state of the) carry flag)
+			0xf5 => Inst::InvertFlag(Flag::Carry),
 			0xf6 => {
-				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				match inst_index {
 					0 => {
 						let imm = self.read_ip_u8();
 						Inst::BitwiseCompareWithAnd(SourceDestination::Size8(DataLocation8::Immediate(imm), destination))
 					}
 					2 => Inst::Negate(DataLocation::Size8(destination)),
-					_ => panic!("Unknown 0xf6 mode: 0x{:x}", inst_index)
+					3 => Inst::NegateSigned(DataLocation::Size8(destination)),
+					4...7 => Inst::ScalarOperation8{mode: self.get_standard_scalar_mode(inst_index as u8), value_quot_rem: Reg::AX, by: destination},
+					_ => {
+						//println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
+						panic!("Unknown 0xf6 mode: 0x{:x}", inst_index)
+					}
 				}
 			}
 			0xf7 => {
-				// TODO: Borken on #698060.
-				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				match inst_index {
 					0 => {
 						let imm = self.read_ip_u16();
 						Inst::BitwiseCompareWithAnd(SourceDestination::Size16(DataLocation16::Immediate(imm), destination))
 					}
 					2 => Inst::Negate(DataLocation::Size16(destination)),
+					3 => Inst::NegateSigned(DataLocation::Size16(destination)),
 					4...7 => Inst::ScalarOperation16{mode: self.get_standard_scalar_mode(inst_index as u8), value_low_quot: Reg::AX, value_high_rem: Reg::DX, by: destination},
 					_ => panic!("Unknown 0xf7 mode: 0x{:x}", inst_index)
 				}
@@ -1423,7 +1452,7 @@ impl Machine8086 {
 			0xfc => Inst::SetFlag(Flag::Direction, false),
 			0xfd => Inst::SetFlag(Flag::Direction, true),
 			0xfe => {
-				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u8(Reg::DS);
+				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				match inst_index {
 					0 => Inst::Inc(DataLocation::Size8(destination)),
 					1 => Inst::Dec(DataLocation::Size8(destination)),
@@ -1431,7 +1460,7 @@ impl Machine8086 {
 				}
 			}
 			0xff => {
-				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16(Reg::DS, None);
+				let (inst_index, destination) = self.read_modrm_with_immediate_reg_u16();
 				match inst_index {
 					0 => {
 						Inst::Inc(DataLocation::Size16(destination))
@@ -1586,6 +1615,7 @@ impl Machine8086 {
 					self.set_flag(Flag::Overflow, value.most_significant_bit(0) != self.get_flag(Flag::Carry));
 				}
 				self.set_flag(Flag::Adjust, (rotate_amount & 0x1f) != 0);
+				self.set_standard_zero_sign_partiy_flags(value);
 			}
 			ShiftMode::ShiftRight => { // SHR
 				let original_value = value;
@@ -1597,6 +1627,7 @@ impl Machine8086 {
 				if masked_rotate_amount == 1 {
 					self.set_flag(Flag::Overflow, original_value.most_significant_bit(0));
 				}
+				self.set_standard_zero_sign_partiy_flags(value);
 			}
 			// SAL: ShiftMode::ShiftLeftArithmethic is the same as ShiftMode::ShiftLeft
 			ShiftMode::ShiftRightArithmethic => { // SAR
@@ -1608,10 +1639,9 @@ impl Machine8086 {
 				if masked_rotate_amount == 1 {
 					self.set_flag(Flag::Overflow, false);
 				}
+				self.set_standard_zero_sign_partiy_flags(value);
 			}
 		};
-		
-		self.set_standard_zero_sign_partiy_flags(value);
 		
 		value
 	}
@@ -1664,6 +1694,12 @@ impl Machine8086 {
 			Inst::Pop16(ref location) => {
 				let value = self.pop_u16();
 				self.set_data_u16(location, value);
+			}
+			Inst::PopFlags => {
+				let mut value = self.pop_u16();
+				// TODO: ZETA sets these bits, which seems wrong.
+				value |= 0xf002;
+				self.set_reg_u16(Reg::Flags, value);
 			}
 			Inst::PushAllGeneralPurposeRegisters => {
 				let start_sp = self.get_reg_u16(Reg::SP);
@@ -1757,10 +1793,62 @@ impl Machine8086 {
 				}
 			}
 			Inst::ScalarOperation8{mode, value_quot_rem, ref by} => {
-				unimplemented!();
+				match mode {
+					ScalarMode::Mul => {
+						let value = self.get_reg_u8(value_quot_rem, RegHalf::Low);
+						let by_value = self.get_data_u8(by);
+						let result = (value as u16).wrapping_mul(by_value as u16);
+						self.set_reg_u16(value_quot_rem, result);
+						let bigger_than_u8 = result > 0xff;
+						self.set_flag(Flag::Overflow, bigger_than_u8);
+						self.set_flag(Flag::Carry, bigger_than_u8);
+					}
+					ScalarMode::Div => {
+						let value = self.get_reg_u16(value_quot_rem);
+						let divisor = self.get_data_u8(by);
+						if divisor == 0 {
+							// Divide by zero
+							self.interrupt_on_next_step(0);
+						} else {
+							let quotient = value / (divisor as u16);
+							let quotient8 = (quotient & 0xff) as u8;
+							let remainder = (value % (divisor as u16)) as u8;
+							if quotient != quotient8 as u16 {
+								// Result doesn't fit
+								self.interrupt_on_next_step(0);
+							} else {
+								self.set_reg_u8(value_quot_rem, RegHalf::High, remainder);
+								self.set_reg_u8(value_quot_rem, RegHalf::Low, quotient8);
+							}
+						}
+					}
+					_ => panic!("Unimplemented: {:?}", mode)
+				}
 			}
 			Inst::ScalarOperation16{mode, value_low_quot, value_high_rem, ref by} => {
 				match mode {
+					ScalarMode::Mul => {
+						let value = self.get_reg_u16(value_low_quot);
+						let by_value = self.get_data_u16(by);
+						let result = (value as u32).wrapping_mul(by_value as u32);
+						self.set_reg_u16(value_low_quot, (result & 0xffff) as u16);
+						self.set_reg_u16(value_high_rem, ((result & 0xffff0000) >> 16) as u16);
+						let bigger_than_u16 = result > 0xffff;
+						self.set_flag(Flag::Overflow, bigger_than_u16);
+						self.set_flag(Flag::Carry, bigger_than_u16);
+					}
+					ScalarMode::SignedMul => {
+						let value = treat_u16_as_i16(self.get_reg_u16(value_low_quot));
+						let by_value = treat_u16_as_i16(self.get_data_u16(by));
+						let signed_result = (value as i32).wrapping_mul(by_value as i32);
+						let result = treat_i32_as_u32(signed_result);
+						let result_low = (result & 0xffff) as u16;
+						self.set_reg_u16(value_low_quot, result_low);
+						self.set_reg_u16(value_high_rem, ((result & 0xffff0000) >> 16) as u16);
+						let bigger_than_i16 = treat_u16_as_i16(result_low) as i32 != signed_result;
+						self.set_flag(Flag::Overflow, bigger_than_i16);
+						self.set_flag(Flag::Carry, bigger_than_i16);
+					}
 					ScalarMode::Div => {
 						let value = self.get_reg_u16(value_low_quot) as u32 + ((self.get_reg_u16(value_high_rem) as u32) << 16);
 						let divisor = self.get_data_u16(by);
@@ -1770,12 +1858,32 @@ impl Machine8086 {
 						} else {
 							let quotient = value / (divisor as u32);
 							let quotient16 = (quotient & 0xffff) as u16;
-							let remainder = (value % (divisor as u32)) as u16;
 							if quotient != quotient16 as u32 {
 								// Result doesn't fit
 								self.interrupt_on_next_step(0);
 							} else {
+								let remainder = (value % (divisor as u32)) as u16;
 								self.set_reg_u16(value_low_quot, quotient16);
+								self.set_reg_u16(value_high_rem, remainder);
+							}
+						}
+					}
+					ScalarMode::SignedDiv => {
+						// TODO
+						let value = treat_u32_as_i32(self.get_reg_u16(value_low_quot) as u32 + ((self.get_reg_u16(value_high_rem) as u32) << 16));
+						let divisor = treat_u16_as_i16(self.get_data_u16(by));
+						if divisor == 0 {
+							// Divide by zero
+							self.interrupt_on_next_step(0);
+						} else {
+							let quotient = value / (divisor as i32);
+							if quotient >= 0x8000 || quotient < -0x8000 {
+								// Result doesn't fit
+								self.interrupt_on_next_step(0);
+							} else {
+								let unsigned_quotient16 = treat_i16_as_u16(quotient as i16);
+								let remainder = treat_i16_as_u16((value % (divisor as i32)) as i16);
+								self.set_reg_u16(value_low_quot, unsigned_quotient16);
 								self.set_reg_u16(value_high_rem, remainder);
 							}
 						}
@@ -1790,6 +1898,18 @@ impl Machine8086 {
 			Inst::Negate(DataLocation::Size16(ref target)) => {
 				let value = self.get_data_u16(&target);
 				self.set_data_u16(&target, !value);
+			}
+			Inst::NegateSigned(DataLocation::Size8(ref target)) => {
+				let value = self.get_data_u8(&target);
+				self.set_flag(Flag::Carry, value != 0);
+				let neg = treat_i8_as_u8(-treat_u8_as_i8(value));
+				self.set_data_u8(&target, neg);
+			}
+			Inst::NegateSigned(DataLocation::Size16(ref target)) => {
+				let value = self.get_data_u16(&target);
+				self.set_flag(Flag::Carry, value != 0);
+				let neg = treat_i16_as_u16(-treat_u16_as_i16(value));
+				self.set_data_u16(&target, neg);
 			}
 			Inst::Inc(DataLocation::Size8(ref target)) => {
 				let value = self.get_data_u8(&target);
@@ -1909,6 +2029,9 @@ impl Machine8086 {
 			}*/
 			Inst::SetFlag(flag, on) => {
 				self.set_flag(flag, on);
+			}
+			Inst::InvertFlag(flag) => {
+				self.set_flag(flag, !self.get_flag(flag));
 			}
 			Inst::RepeatNextRegTimes{reg, until_zero_flag} => {
 				// https://www.felixcloutier.com/x86/rep:repe:repz:repne:repnz
@@ -2031,6 +2154,17 @@ impl Machine8086 {
 			}
 			Inst::Halt => {
 				self.halted = true;
+			}
+			Inst::SignExtend8To16{ref source, ref destination} => {
+				let value = self.get_data_u8(&source);
+				let result = treat_i16_as_u16(treat_u8_as_i8(value) as i16);
+				self.set_data_u16(&destination, result);
+			}
+			Inst::SignExtend16To32{ref source, ref destination_high, ref destination_low} => {
+				let value = self.get_data_u16(&source);
+				let result = treat_i32_as_u32(treat_u16_as_i16(value) as i32);
+				self.set_data_u16(&destination_low, (result & 0xffff) as u16);
+				self.set_data_u16(&destination_high, ((result >> 16) & 0xffff) as u16);
 			}
 		}
 	}
@@ -2315,7 +2449,7 @@ fn main() {
     event_handler.init_machine(&mut machine);
     let mut step_count = 0;
     loop {
-		if step_count % 20 == 0 {
+		if step_count % 1000 == 0 {
 			//println!("interrupt 0x08");
 			machine.interrupt_on_next_step(0x08);
 		}
