@@ -8,6 +8,8 @@ use num_derive::FromPrimitive;
 // https://wiki.osdev.org/MZ
 
 const EXE_PARAGRAPH_BYTES: usize = 16;
+// The Program Segment Prefix is 256 bytes in size, which is 16 paragraphs.
+const EXE_PROGRAM_SEGMENT_PREFIX_PARAGRAPHS: usize = 16;
 const EXE_BLOCK_BYTES: usize = 512;
 // This is the paragraph where the EXE file puts the code data.
 const EXE_ORIGIN_PARAGRAPH: usize = 0x100;
@@ -102,7 +104,7 @@ impl MzHeader {
 		machine.set_reg_u16(Reg::SP, self.initial_sp);
 		machine.set_reg_u16(Reg::IP, self.initial_ip);
 		
-		let segment_offset = (EXE_ORIGIN_PARAGRAPH + EXE_PARAGRAPH_BYTES) as u16;
+		let segment_offset = (EXE_ORIGIN_PARAGRAPH + EXE_PROGRAM_SEGMENT_PREFIX_PARAGRAPHS) as u16;
 		machine.set_reg_u16(Reg::SS, self.initial_ss + segment_offset);
 		machine.set_reg_u16(Reg::CS, self.initial_cs + segment_offset);
 		
@@ -164,7 +166,7 @@ fn initialise_bios_data_area(machine: &mut Machine8086) {
 // https://en.wikipedia.org/wiki/Program_Segment_Prefix
 fn initialise_dos_program_segment_prefix(machine: &mut Machine8086, program_size: usize, command_line_tail: &[u8]) -> Result<(), String> {
 	// The DS register will be the PSP location when a program starts.
-	let psp_start = machine.get_seg_origin(Reg::DS);
+	let psp_start = (EXE_ORIGIN_PARAGRAPH * EXE_PARAGRAPH_BYTES) as u32; //machine.get_seg_origin(Reg::DS);
 	// CP/M exit: Always 20h
 	//machine.poke_u16(psp_start + 0x00, 0x20);
 	// These values are probably all wrong:
@@ -845,16 +847,14 @@ impl Machine8086 {
 		*reg_value = reg_value.wrapping_sub(amount);
 	}
 
-	fn get_seg_origin(&self, seg_reg: Reg) -> u32 {
-		((self.registers[seg_reg as usize] as u32) << 4) & 0xFFFFF
-	}
-
+	// 8086 has 20 address bits
+	// http://www.renyujie.net/articles/article_ca_x86_4.php
 	fn get_seg_offset(&self, seg_reg: Reg, offset: u16) -> u32 {
-		(((self.registers[seg_reg as usize] as u32) << 4) + offset as u32) & 0xFFFFF
+		(((self.get_reg_u16(seg_reg) as u32) << 4) + offset as u32) & 0xfffff
 	}
 
 	fn get_seg_reg(&self, seg_reg: Reg, reg: Reg) -> u32 {
-		(((self.registers[seg_reg as usize] as u32) << 4) + self.registers[reg as usize] as u32) & 0xFFFFF
+		self.get_seg_offset(seg_reg, self.get_reg_u16(reg))
 	}
 	
 	fn get_ip(&self) -> u32 {
@@ -878,6 +878,10 @@ impl Machine8086 {
 	}
 	
 	fn poke_u16(&mut self, at: u32, value: u16) {
+		if at >= 4098 && at < 4100 {
+			println!("poke_u8 {} {}", at, value);
+		}
+	
 		self.memory[at as usize] = (value & 0x00ff) as u8;
 		self.memory[at as usize + 1] = ((value & 0xff00) >> 8) as u8;
 	}
@@ -1109,7 +1113,7 @@ impl Machine8086 {
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		if self.number_of_parsed_instructions >= 698000 {
+		if self.number_of_parsed_instructions >= 0{//697000 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
@@ -1264,12 +1268,13 @@ impl Machine8086 {
 			0x9d => Inst::PopFlags,
 			// MOV (moffs16 -> AX)
 			0xa1 => {
-				// TODO: 772735
+				// TODO: -772735-, 697514
 				let offset = self.read_ip_u16();
 				let addr = self.get_seg_offset(self.resolve_default_segment(Reg::DS), offset) as usize;
-				println!("{:?}", addr);
-				for b in &self.memory[addr..addr+10] {
-					println!("a1: {}", b);
+				dbg!(offset);
+				println!("{:?} {}", addr, offset);
+				for b in addr..addr+10 {
+					println!("a1: {}", self.peek_u16(b as u32));
 				}
 				Inst::Mov(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(offset)}, DataLocation16::Reg(Reg::AX)))
 			}
@@ -1281,16 +1286,16 @@ impl Machine8086 {
 				let addr = self.read_ip_u16();
 				Inst::Mov(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(addr)}))
 			}
-			// MOVSB 
+			// MOVSB (the ES segment cannot be overridden)
 			// "string" means that it increments (or decrements if the direction flag is set) the
 			// memory address register(s) after doing an operation.
-			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
-			// MOVSW
-			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
-			// STOSB
-			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
-			// STOSW
-			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: self.resolve_default_segment(Reg::ES), address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
+			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			// MOVSW (the ES segment cannot be overridden)
+			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			// STOSB (the ES segment cannot be overridden)
+			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
+			// STOSW (the ES segment cannot be overridden)
+			0xab => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// LODSB
 			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
 			// LODSW
@@ -2206,8 +2211,8 @@ impl Machine8086 {
 			if self.number_of_parsed_instructions > 1000000 {
 				println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
 				panic!();
-				//println!("{:?}", inst);
 			}
+			println!("{:?}", inst);
 			self.apply_instruction(&inst);
 		}
 	}
