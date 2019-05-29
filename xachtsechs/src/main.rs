@@ -639,11 +639,15 @@ enum Inst {
 	JumpZeroReg{offset: i32, reg: Reg},
 	Interrupt(u8),
 	InterruptIf(u8, Flag),
+	ReturnFromInterrupt,
 	Halt,
 	// Get the lower half of the register and sign-extend it to 16 bits and put that value back in
 	// the register.
 	SignExtend8To16{source: DataLocation8, destination: DataLocation16},
 	SignExtend16To32{source: DataLocation16, destination_high: DataLocation16, destination_low: DataLocation16},
+	// Port input into a byte will just crop the input, since the input is 2 bytes.
+	PortInput{port_index: DataLocation16, destination: DataLocation},
+	PortOutput{port_index: DataLocation16, source: DataLocation},
 	// Override the default segment for the next instruction.
 	// https://www.quora.com/Why-is-a-segment-override-prefix-used-with-an-example-in-8086-microprocessor
 	//OverrideNextDefaultSegment(Reg)
@@ -656,6 +660,10 @@ enum InterruptResult {
 
 trait EventHandler {
 	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult;
+	
+	fn handle_port_input(&mut self, machine: &mut Machine8086, port_index: u16) -> u16;
+	
+	fn handle_port_output(&mut self, machine: &mut Machine8086, port_index: u16, value: u16);
 }
 
 /// This is the size of one entry in the interrupt table. Each entry consists of a IP, followed by
@@ -886,6 +894,20 @@ impl Machine8086 {
 		self.memory[at as usize + 1] = ((value & 0xff00) >> 8) as u8;
 	}
 	
+	fn read_null_terminated_string(&self, start: u32) -> Vec<u8> {
+		let mut result = vec![];
+		let mut current = start;
+		loop {
+			let c = self.peek_u8(current);
+			if c == 0 {
+				break;
+			}
+			result.push(c);
+			current += 1;
+		}
+		result
+	}
+	
 	fn push_u16(&mut self, value: u16) {
 		//println!("Push16({})", value);
 		self.sub_from_reg(Reg::SP, 2);
@@ -1113,9 +1135,9 @@ impl Machine8086 {
 	fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		if self.number_of_parsed_instructions >= 0{//697000 {
-			println!("{:?}", self.registers);
-			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+		if self.number_of_parsed_instructions >= 697000 {
+			//println!("{:?}", self.registers);
+			//println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
 		/*if self.number_of_parsed_instructions > 697516 {//697762 {
@@ -1266,16 +1288,14 @@ impl Machine8086 {
 			0x9c => Inst::Push16(DataLocation16::Reg(Reg::Flags)),
 			// POPF
 			0x9d => Inst::PopFlags,
+			// MOV (moffs8 -> AX)
+			0xa0 => {
+				let offset = self.read_ip_u16();
+				Inst::Mov(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(offset)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)))
+			}
 			// MOV (moffs16 -> AX)
 			0xa1 => {
-				// TODO: -772735-, 697514
 				let offset = self.read_ip_u16();
-				let addr = self.get_seg_offset(self.resolve_default_segment(Reg::DS), offset) as usize;
-				dbg!(offset);
-				println!("{:?} {}", addr, offset);
-				for b in addr..addr+10 {
-					println!("a1: {}", self.peek_u16(b as u32));
-				}
 				Inst::Mov(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Immediate(offset)}, DataLocation16::Reg(Reg::AX)))
 			}
 			0xa2 => {
@@ -1292,6 +1312,15 @@ impl Machine8086 {
 			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
 			// MOVSW (the ES segment cannot be overridden)
 			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			// TEST
+			0xa8 => {
+				let imm = self.read_ip_u8();
+				Inst::BitwiseCompareWithAnd(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Immediate(imm)))
+			}
+			0xa9 => {
+				let imm = self.read_ip_u16();
+				Inst::BitwiseCompareWithAnd(SourceDestination::Size16(DataLocation16::Reg(Reg::AX), DataLocation16::Immediate(imm)))
+			}
 			// STOSB (the ES segment cannot be overridden)
 			0xaa => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			// STOSW (the ES segment cannot be overridden)
@@ -1365,6 +1394,8 @@ impl Machine8086 {
 				// INTO calls the overflow exception, which is #4
 				Inst::InterruptIf(4, Flag::Overflow)
 			}
+			// IRET
+			0xcf => Inst::ReturnFromInterrupt,
 			0xd0 => {
 				let (shift_index, destination) = self.read_modrm_with_immediate_reg_u8();
 				let shift_mode = ShiftMode::from_u8(shift_index).unwrap();
@@ -1399,6 +1430,23 @@ impl Machine8086 {
 				let offset = treat_u8_as_i8(self.read_ip_u8()) as i32;
 				Inst::JumpZeroReg{offset, reg: Reg::CX}
 			}
+			// IN
+			0xe4 => {
+				let port_index = self.read_ip_u8() as u16;
+				Inst::PortInput{port_index: DataLocation16::Immediate(port_index), destination: DataLocation::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low))}
+			}
+			0xe5 => {
+				let port_index = self.read_ip_u8() as u16;
+				Inst::PortInput{port_index: DataLocation16::Immediate(port_index), destination: DataLocation::Size16(DataLocation16::Reg(Reg::AX))}
+			}
+			0xe6 => {
+				let port_index = self.read_ip_u8() as u16;
+				Inst::PortOutput{port_index: DataLocation16::Immediate(port_index), source: DataLocation::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low))}
+			}
+			0xe7 => {
+				let port_index = self.read_ip_u8() as u16;
+				Inst::PortOutput{port_index: DataLocation16::Immediate(port_index), source: DataLocation::Size16(DataLocation16::Reg(Reg::AX))}
+			}
 			0xe8 => {
 				let offset = treat_u16_as_i16(self.read_ip_u16()) as i32;
 				Inst::Call(offset)
@@ -1410,6 +1458,15 @@ impl Machine8086 {
 			0xeb => {
 				let offset = treat_u8_as_i8(self.read_ip_u8()) as i32;
 				Inst::Jump{condition: None, offset}
+			}
+			0xec => {
+				Inst::PortInput{port_index: DataLocation16::Reg(Reg::DX), destination: DataLocation::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low))}
+			}
+			0xee => {
+				Inst::PortOutput{port_index: DataLocation16::Reg(Reg::DX), source: DataLocation::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low))}
+			}
+			0xef => {
+				Inst::PortOutput{port_index: DataLocation16::Reg(Reg::DX), source: DataLocation::Size16(DataLocation16::Reg(Reg::AX))}
 			}
 			0xf0 => {
 				// LOCK: This is supposed to set the LOCK pin on the CPU to ON for the duration of
@@ -1487,6 +1544,9 @@ impl Machine8086 {
 						} else {
 							panic!("Expected Memory for JMPF: {:?}", destination);
 						}
+					}
+					6 => {
+						Inst::Push16(destination)
 					}
 					_ => panic!("Unknown 0xff mode: 0x{:x}", inst_index)
 				}
@@ -1690,7 +1750,7 @@ impl Machine8086 {
 		self.pending_interrupts.push_back(interrupt_index);
 	}
 	
-	fn apply_instruction(&mut self, inst: &Inst) {
+	fn apply_instruction(&mut self, inst: &Inst, event_handler: &mut EventHandler) {
 		match *inst {
 			Inst::NoOp => {}
 			Inst::Push16(ref location) => {
@@ -1739,7 +1799,7 @@ impl Machine8086 {
 					// Loading the SS register with MOV skips interrupts, so just manually execute another instruction to force them to be skipped.
 					// TODO: Move this into a machine state.
 					let next_inst = self.parse_instruction();
-					self.apply_instruction(&next_inst);
+					self.apply_instruction(&next_inst, event_handler);
 				}
 			}
 			Inst::Load32{seg, ref address16, out_reg_h, out_reg_l} => {
@@ -2053,7 +2113,7 @@ impl Machine8086 {
 				//dbg!(self.get_reg_u16(reg));
 				while self.get_reg_u16(reg) != 0 {
 					// TODO: Service pending interrupts
-					self.apply_instruction(&repeat_inst);
+					self.apply_instruction(&repeat_inst, event_handler);
 					self.sub_from_reg(reg, 1);
 					//dbg!(self.get_reg_u16(reg));
 					/*if self.get_reg_u16(reg) == 0 {
@@ -2157,6 +2217,14 @@ impl Machine8086 {
 					self.interrupt(interrupt_index);
 				}
 			}
+			Inst::ReturnFromInterrupt => {
+				let ip = self.pop_u16();
+				let cs = self.pop_u16();
+				let flags = self.pop_u16();
+				self.set_reg_u16(Reg::IP, ip);
+				self.set_reg_u16(Reg::CS, cs);
+				self.set_reg_u16(Reg::Flags, flags);
+			}
 			Inst::Halt => {
 				self.halted = true;
 			}
@@ -2170,6 +2238,26 @@ impl Machine8086 {
 				let result = treat_i32_as_u32(treat_u16_as_i16(value) as i32);
 				self.set_data_u16(&destination_low, (result & 0xffff) as u16);
 				self.set_data_u16(&destination_high, ((result >> 16) & 0xffff) as u16);
+			}
+			Inst::PortInput{ref port_index, destination: DataLocation::Size8(ref destination)} => {
+				let port_index_value = self.get_data_u16(port_index);
+				let port_result = event_handler.handle_port_input(self, port_index_value);
+				self.set_data_u8(destination, (port_result & 0xff) as u8);
+			}
+			Inst::PortInput{ref port_index, destination: DataLocation::Size16(ref destination)} => {
+				let port_index_value = self.get_data_u16(port_index);
+				let port_result = event_handler.handle_port_input(self, port_index_value);
+				self.set_data_u16(destination, port_result);
+			}
+			Inst::PortOutput{ref port_index, source: DataLocation::Size8(ref source)} => {
+				let port_index_value = self.get_data_u16(port_index);
+				let value = self.get_data_u8(source) as u16;
+				event_handler.handle_port_output(self, port_index_value, value);
+			}
+			Inst::PortOutput{ref port_index, source: DataLocation::Size16(ref source)} => {
+				let port_index_value = self.get_data_u16(port_index);
+				let value = self.get_data_u16(source);
+				event_handler.handle_port_output(self, port_index_value, value);
 			}
 		}
 	}
@@ -2208,12 +2296,12 @@ impl Machine8086 {
 		
 		if !handled_interrupt {
 			let inst = self.parse_instruction();
-			if self.number_of_parsed_instructions > 1000000 {
+			if self.number_of_parsed_instructions > 2000000 {
 				println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
 				panic!();
 			}
-			println!("{:?}", inst);
-			self.apply_instruction(&inst);
+			//println!("{:?}", inst);
+			self.apply_instruction(&inst, event_handler);
 		}
 	}
 }
@@ -2269,10 +2357,105 @@ const EGA_MODES: [VideoMode; 1] = [
 	},
 ];
 
+trait DosFileSystem : std::fmt::Debug {
+	/// Returns a file handle if successful. Error code if not.
+	fn create(&mut self, filename: Vec<u8>, attributes: u16) -> Result<u16, u16>;
+	/// Returns a file handle if successful. Error code if not.
+	fn open(&mut self, filename: Vec<u8>, access_modes: u8) -> Result<u16, u16>;
+	/// Retruns error code if close failed.
+	fn close(&mut self, handle: u16) -> Result<(), u16>;
+	/// Returns the byte count read. Error code if read failed.
+	fn read(&mut self, handle: u16, count: u16, destination: &[u8]) -> Result<u16, u16>;
+	/// Returns the byte count written. Error code if write failed.
+	fn write(&mut self, handle: u16, count: u16, data: &[u8]) -> Result<u16, u16>;
+}
+
+#[derive(Debug)]
+struct StandardDosFileSystem {
+	file_handles: Vec<Option<std::fs::File>>,
+}
+
+impl StandardDosFileSystem {
+	fn new() -> StandardDosFileSystem {
+		StandardDosFileSystem {
+			file_handles: vec![],
+		}
+	}
+	
+	fn get_empty_slot(&mut self) -> usize {
+		match self.file_handles.iter().position(|ref slot| slot.is_none()) {
+			Some(pos) => pos,
+			None => {
+				let pos = self.file_handles.len();
+				self.file_handles.push(None);
+				pos
+			}
+		}
+	}
+	
+	fn get_real_filename(&self, filename: &[u8]) -> String {
+		"./dos/".to_string() + &String::from_utf8_lossy(filename)
+	}
+}
+
+impl DosFileSystem for StandardDosFileSystem {
+	fn create(&mut self, filename: Vec<u8>, attributes: u16) -> Result<u16, u16> {
+		let string_filename = self.get_real_filename(&filename);
+		let slot = self.get_empty_slot();
+		match std::fs::File::create(string_filename) {
+			Ok(file) => {
+				self.file_handles[slot] = Some(file);
+				Ok(slot as u16)
+			}
+			Err(_) => Err(0x03),
+		}
+	}
+	fn open(&mut self, filename: Vec<u8>, access_modes: u8) -> Result<u16, u16> {
+		let string_filename = self.get_real_filename(&filename);
+		let slot = self.get_empty_slot();
+		match std::fs::File::open(string_filename) {
+			Ok(file) => {
+				self.file_handles[slot] = Some(file);
+				Ok(slot as u16)
+			}
+			Err(_) => Err(0x03),
+		}
+	}
+	fn close(&mut self, handle: u16) -> Result<(), u16> {
+		unimplemented!()
+	}
+	fn read(&mut self, handle: u16, count: u16, destination: &[u8]) -> Result<u16, u16> {
+		unimplemented!()
+	}
+	fn write(&mut self, handle: u16, count: u16, data: &[u8]) -> Result<u16, u16> {
+		unimplemented!()
+	}
+}
+
 #[derive(Debug, Clone, PartialEq)]
+struct PortStates {
+	port_61: u16,
+	crt_index_register: u16,
+	cga_status_register: u16,
+}
+
+impl PortStates {
+	fn new() -> PortStates {
+		PortStates {
+			port_61: 0,
+			crt_index_register: 0,
+			cga_status_register: 0,
+		}
+	}
+}
+
+#[derive(Debug)]
 struct DosEventHandler {
 	machine_type: MachineType,
 	video_mode: VideoMode,
+	port_states: PortStates,
+	file_system: Box<DosFileSystem>,
+	seconds_since_start: f64,
 }
 
 impl DosEventHandler {
@@ -2290,14 +2473,82 @@ impl DosEventHandler {
 		self.video_mode = self.lookup_video_mode(mode_index).unwrap();
 		
 	}*/
+	
+	fn set_cga_vertial_retrace(&mut self, vertical_retrace: bool) {
+		if vertical_retrace {
+			self.port_states.cga_status_register |= 0b1000u16;
+		} else {
+			self.port_states.cga_status_register &= !0b1000u16;
+		}
+	}
 
+	fn get_page_origin_address(&self, machine: &Machine8086, video_page: u8) -> u32 {
+		let page_bytes = machine.get_data_u16(&BIOS_TEXT_PAGE_BYTES);
+		self.video_mode.text_address + (video_page as u32 * page_bytes as u32)
+	}
+	
+	fn get_screen_character_address(&self, machine: &Machine8086, page_origin_address: u32, x: u8, y: u8) -> u32 {
+		let bytes_per_char = 2;
+		let column_count = machine.get_data_u16(&BIOS_TEXT_COLUMN_COUNT);
+		page_origin_address + (((y as u32 * column_count as u32) + x as u32) * bytes_per_char)
+	}
+	
 	fn handle_interrupt_10h(&mut self, machine: &mut Machine8086) {
 		// Video (http://www.ctyme.com/intr/int-10.htm)
 		let video_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
 		println!("Video interrupt: 0x{:x}", video_int);
 		match video_int {
+			0x02 => {
+				// Set cursor position.
+				let bh = machine.get_reg_u8(Reg::BX, RegHalf::High);
+				let video_page = if bh == 0xff { machine.get_data_u8(&BIOS_ACTIVE_VIDEO_PAGE) } else { bh };
+				
+				let dh = machine.get_reg_u8(Reg::DX, RegHalf::High);
+				let dl = machine.get_reg_u8(Reg::DX, RegHalf::High);
+				let cursor_pos_data = ((dh as u16) << 8) + dl as u16;
+				machine.set_data_u16(&BIOS_CURSOR_POSITION[video_page as usize], cursor_pos_data);
+			}
+			0x06 => {
+				// Scroll the text up within a rectangular area on the active page.
+				let video_page = machine.get_data_u8(&BIOS_ACTIVE_VIDEO_PAGE);
+				let num_lines = machine.get_reg_u8(Reg::AX, RegHalf::Low);
+				let blank_char_attributes = machine.get_reg_u8(Reg::BX, RegHalf::High);
+				let rect_top = machine.get_reg_u8(Reg::CX, RegHalf::High);
+				let rect_left = machine.get_reg_u8(Reg::CX, RegHalf::Low);
+				let rect_bottom = machine.get_reg_u8(Reg::DX, RegHalf::High);
+				let rect_right = machine.get_reg_u8(Reg::DX, RegHalf::Low);
+				let page_addr = self.get_page_origin_address(machine, video_page);
+				
+				if num_lines == 0 {
+					// Clear the window.
+					for y in rect_top ..= rect_bottom {
+						for x in rect_left ..= rect_right {
+							let char_addr = self.get_screen_character_address(machine, page_addr, x, y);
+							machine.poke_u8(char_addr, 0);
+							machine.poke_u8(char_addr + 1, blank_char_attributes);
+						}
+					}
+				} else {
+					for y in rect_top ..= (rect_bottom - num_lines) {
+						for x in rect_left ..= rect_right {
+							let from_addr = self.get_screen_character_address(machine, page_addr, x, y + 1);
+							let to_addr = self.get_screen_character_address(machine, page_addr, x, y);
+							let char_data = machine.peek_u16(from_addr);
+							machine.poke_u16(to_addr, char_data);
+						}
+					}
+					for y in (rect_bottom - num_lines + 1) ..= rect_bottom {
+						for x in rect_left ..= rect_right {
+							let char_addr = self.get_screen_character_address(machine, page_addr, x, y);
+							machine.poke_u8(char_addr, 0);
+							machine.poke_u8(char_addr + 1, blank_char_attributes);
+						}
+					}
+				}
+			}
 			0x08 => {
 				// Read char and attributes at cursor position
+				// TODO
 				/*let bh = machine.get_reg_u8(Reg::BX, RegHalf::High);
 				let bl = machine.get_reg_u8(Reg::BX, RegHalf::Low);
 				let video_page = if bh == 0xff { machine.get_data_u8(&BIOS_ACTIVE_VIDEO_PAGE) } else { bh };
@@ -2401,6 +2652,22 @@ impl EventHandler for DosEventHandler {
 						machine.poke_u16(entry_addr, interrupt_ip);
 						machine.poke_u16(entry_addr + 2, interrupt_cs);
 					}
+					0x2c => {
+						// Get system time.
+						let hundredths = ((self.seconds_since_start * 100.) as usize % 100) as u8;
+						let second = (self.seconds_since_start as usize % 60) as u8;
+						let minute = ((self.seconds_since_start / 60.) as usize % 60) as u8;
+						let hour = ((self.seconds_since_start / 60. / 60.) as usize % 24) as u8;
+						machine.set_reg_u8(Reg::CX, RegHalf::High, hour);
+						machine.set_reg_u8(Reg::CX, RegHalf::Low, minute);
+						machine.set_reg_u8(Reg::DX, RegHalf::High, second);
+						machine.set_reg_u8(Reg::DX, RegHalf::Low, hundredths);
+					}
+					0x33 => {
+						// Modify Ctrl+Break shortcut functionality.
+						// TODO
+						machine.set_reg_u8(Reg::DX, RegHalf::Low, 0);
+					}
 					0x35 => {
 						// Get an entry of the interrupt vector/table (IP:CS) and store it in ES:BX.
 						let entry_addr = machine.get_reg_u8(Reg::AX, RegHalf::Low) as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
@@ -2408,6 +2675,38 @@ impl EventHandler for DosEventHandler {
 						let interrupt_cs = machine.peek_u16(entry_addr + 2);
 						machine.set_reg_u16(Reg::BX, interrupt_ip);
 						machine.set_reg_u16(Reg::ES, interrupt_cs);
+					}
+					0x3c => {
+						// CREAT
+						let filename_addr = machine.get_seg_reg(Reg::DS, Reg::DX);
+						let filename = machine.read_null_terminated_string(filename_addr);
+						let attributes = machine.get_reg_u16(Reg::CX);
+						match self.file_system.create(filename, attributes) {
+							Ok(handle) => {
+								machine.set_flag(Flag::Carry, false);
+								machine.set_reg_u16(Reg::AX, handle);
+							}
+							Err(error_code) => {
+								machine.set_flag(Flag::Carry, true);
+								machine.set_reg_u16(Reg::AX, error_code);
+							}
+						}
+					}
+					0x3d => {
+						// OPEN
+						let filename_addr = machine.get_seg_reg(Reg::DS, Reg::DX);
+						let filename = machine.read_null_terminated_string(filename_addr);
+						let access_modes = machine.get_reg_u8(Reg::AX, RegHalf::Low);
+						match self.file_system.open(filename, access_modes) {
+							Ok(handle) => {
+								machine.set_flag(Flag::Carry, false);
+								machine.set_reg_u16(Reg::AX, handle);
+							}
+							Err(error_code) => {
+								machine.set_flag(Flag::Carry, true);
+								machine.set_reg_u16(Reg::AX, error_code);
+							}
+						}
 					}
 					0x44 => {
 						// I/O control
@@ -2419,16 +2718,67 @@ impl EventHandler for DosEventHandler {
 								machine.set_reg_u16(Reg::AX, 1);
 								machine.set_flag(Flag::Carry, true);
 							}
-							_ => panic!("Unknown IO func: 0x{:x}", io_func)
+							_ => println!("Unknown IO func: 0x{:x}", io_func)
 						}
 					}
 					_ => panic!("Unknown DOS interrupt: 0x{:x}", dos_int)
+				}
+			}
+			0x33 => {
+				// Mouse function calls
+				// http://stanislavs.org/helppc/int_33.html
+				let mouse_func = machine.get_reg_u16(Reg::AX);
+				match mouse_func {
+					0 => {
+						// TODO get mouse installed flag
+					}
+					_ => panic!("Unknown mouse function: 0x{:x}", mouse_func)
 				}
 			}
 			_ => panic!("Unknown interrupt: 0x{:x}", interrupt_index)
 		}
 		
 		InterruptResult::Return
+	}
+	
+	fn handle_port_input(&mut self, machine: &mut Machine8086, port_index: u16) -> u16 {
+		// http://bochs.sourceforge.net/techspec/PORTS.LST
+		match port_index {
+			0x61 => {
+				// "Keyboard Controller" control register.
+				// TODO
+				self.port_states.port_61
+			}
+			0x201 => {
+				// TODO: Read joystick values.
+				0
+			}
+			0x3da => {
+				let status = self.port_states.cga_status_register;
+				self.set_cga_vertial_retrace(false);
+				status
+			}
+			_ => panic!("Unhandled input port index: 0x{:02x}", port_index)
+		}
+	}
+	
+	fn handle_port_output(&mut self, machine: &mut Machine8086, port_index: u16, value: u16) {
+		match port_index {
+			0x61 => {
+				// TODO
+				self.port_states.port_61 = value;
+			}
+			0x201 => {
+				// TODO: Something about joystick one-shots?
+			}
+			0x3d4 => {
+				self.port_states.crt_index_register = value;
+			}
+			0x3d5 => {
+				// TODO: CRT data register
+			}
+			_ => panic!("Unhandled output port index: 0x{:02x}", port_index)
+		}
 	}
 }
 
@@ -2450,6 +2800,9 @@ fn main() {
     let mut event_handler = DosEventHandler {
 		machine_type: MachineType::EGA,
 		video_mode: MachineType::EGA.lookup_video_mode(3).unwrap(),
+		port_states: PortStates::new(),
+		file_system: Box::new(StandardDosFileSystem::new()),
+		seconds_since_start: 0.,
     };
     event_handler.init_machine(&mut machine);
     let mut step_count = 0;
@@ -2457,6 +2810,10 @@ fn main() {
 		if step_count % 1000 == 0 {
 			//println!("interrupt 0x08");
 			machine.interrupt_on_next_step(0x08);
+			event_handler.seconds_since_start += 0.01;
+		}
+		if step_count % 100000 == 0 {
+			event_handler.set_cga_vertial_retrace(true);
 		}
 		//println!("before");
 		machine.step(&mut event_handler);
