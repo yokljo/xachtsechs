@@ -1,4 +1,4 @@
-use crate::types::{Address16, AdjustMode, AnyUnsignedInt8086, ArithmeticMode, DataLocation, DataLocation8, DataLocation16, DisplacementOrigin, EventHandler, Flag, Inst, InterruptResult, JumpCondition, JumpConditionType, ModRmRegMode, OpDirection, OpSize, Reg, REG_COUNT, RegHalf, ScalarMode, ShiftMode, SourceDestination, treat_i8_as_u8, treat_u8_as_i8, treat_i16_as_u16, treat_u16_as_i16, treat_i32_as_u32, treat_u32_as_i32, u8_on_bits_are_odd};
+use crate::types::{Address16, AdjustMode, AnyUnsignedInt8086, ArithmeticMode, DataLocation, DataLocation8, DataLocation16, DisplacementOrigin, EventHandler, Flag, Inst, InterruptResult, JumpCondition, JumpConditionType, ModRmRegMode, OpDirection, OpSize, Reg, REG_COUNT, RegHalf, ScalarMode, ShiftMode, SourceDestination, StepResult, treat_i8_as_u8, treat_u8_as_i8, treat_i16_as_u16, treat_u16_as_i16, treat_i32_as_u32, treat_u32_as_i32, u8_on_bits_are_odd};
 
 use num::FromPrimitive;
 use std::collections::VecDeque;
@@ -8,10 +8,10 @@ use std::collections::VecDeque;
 pub const INTERRUPT_TABLE_ENTRY_BYTES: usize = 2 + 2;
 
 pub struct Machine8086 {
-	memory: Vec<u8>,
+	pub memory: Vec<u8>,
 	registers: [u16; REG_COUNT],
 	halted: bool,
-	pending_interrupts: VecDeque<u8>,
+	pub pending_interrupts: VecDeque<u8>,
 	
 	override_default_segment: Option<Reg>,
 	number_of_parsed_instructions: usize,
@@ -223,10 +223,6 @@ impl Machine8086 {
 	}
 	
 	pub fn poke_u16(&mut self, at: u32, value: u16) {
-		if at >= 4098 && at < 4100 {
-			println!("poke_u8 {} {}", at, value);
-		}
-	
 		self.memory[at as usize] = (value & 0x00ff) as u8;
 		self.memory[at as usize + 1] = ((value & 0xff00) >> 8) as u8;
 	}
@@ -472,9 +468,9 @@ impl Machine8086 {
 	pub fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		if self.number_of_parsed_instructions >= 697000 {
-			//println!("{:?}", self.registers);
-			//println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
+		if self.number_of_parsed_instructions >= 776390 {
+			println!("{:?}", self.registers);
+			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}
 		self.number_of_parsed_instructions += 1;
 		/*if self.number_of_parsed_instructions > 697516 {//697762 {
@@ -591,6 +587,7 @@ impl Machine8086 {
 			}
 			// XCHG - swap register/memory with register
 			0x86 | 0x87 => Inst::Swap(self.read_standard_source_destination(opcode, ModRmRegMode::Reg)),
+			// MOV
 			0x88 ... 0x8b => Inst::Mov(self.read_standard_source_destination(opcode, ModRmRegMode::Reg)),
 			0x8c => Inst::Mov(self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Seg)),
 			// LEA
@@ -713,7 +710,6 @@ impl Machine8086 {
 				Inst::Mov(destination.with_immediate_source(imm as u16))
 			}
 			0xc7 => {
-				// TODO: 0xc7  698084
 				let (_, destination) = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Source, ModRmRegMode::Reg).split();
 				let imm = self.read_ip_u16();
 				Inst::Mov(destination.with_immediate_source(imm))
@@ -1016,7 +1012,6 @@ impl Machine8086 {
 				if masked_rotate_amount == 1 {
 					self.set_flag(Flag::Overflow, value.most_significant_bit(0) != self.get_flag(Flag::Carry));
 				}
-				self.set_flag(Flag::Adjust, (rotate_amount & 0x1f) != 0);
 				self.set_standard_zero_sign_partiy_flags(value);
 			}
 			ShiftMode::ShiftRight => { // SHR
@@ -1600,7 +1595,7 @@ impl Machine8086 {
 	}
 	
 	/// Parse and execute one instruction. If there are interrupts to be handled, this will do that instead.
-	pub fn step(&mut self, event_handler: &mut EventHandler) {
+	pub fn step(&mut self, event_handler: &mut EventHandler) -> StepResult {
 		let non_maskable_bios_interrupt = 0x02;
 		
 		if self.get_flag(Flag::Interrupt)
@@ -1613,7 +1608,7 @@ impl Machine8086 {
 		// TODO: Improve this check.
 		let ip = self.get_reg_u16(Reg::IP);
 		let cs = self.get_reg_u16(Reg::CS);
-		let mut handled_interrupt = false;
+		
 		//println!("{:x}, {:x}", ip, cs);
 		if (ip & 0xff00) == 0x1100 && cs == 0xf000 {
 			self.set_flag(Flag::Interrupt, true);
@@ -1623,22 +1618,25 @@ impl Machine8086 {
 				InterruptResult::Return => {
 					self.return_from_interrupt();
 				}
+				InterruptResult::Wait => {
+					self.return_from_interrupt();
+				}
 				InterruptResult::Stop => {
 					panic!();
 				}
 			}
 			
-			handled_interrupt = true;
-		}
-		
-		if !handled_interrupt {
+			StepResult::Interrupt(interrupt_result)
+		} else {
 			let inst = self.parse_instruction();
-			if self.number_of_parsed_instructions > 2000000 {
+			if self.number_of_parsed_instructions > 797780 {
 				println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
 				panic!();
 			}
 			//println!("{:?}", inst);
 			self.apply_instruction(&inst, event_handler);
+			
+			StepResult::Instruction
 		}
 	}
 }

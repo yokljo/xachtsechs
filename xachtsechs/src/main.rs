@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 mod bios_loader;
 mod dos_event_handler;
+mod dos_error_codes;
 mod dos_file_system;
 mod exe_loader;
 mod machine8086;
@@ -11,6 +12,7 @@ use crate::dos_event_handler::{DosEventHandler, MachineType, PortStates};
 use crate::dos_file_system::StandardDosFileSystem;
 use crate::exe_loader::MzHeader;
 use crate::machine8086::Machine8086;
+use crate::types::{InterruptResult, Reg, RegHalf, StepResult};
 
 // https://en.wikipedia.org/wiki/Program_Segment_Prefix
 // https://toonormal.com/2018/06/07/notes-ms-dos-dev-for-intel-8086-cpus-using-a-modern-pc/
@@ -31,23 +33,28 @@ fn main() {
 		machine_type: MachineType::EGA,
 		video_mode: MachineType::EGA.lookup_video_mode(3).unwrap(),
 		port_states: PortStates::new(),
-		file_system: Box::new(StandardDosFileSystem::new()),
+		file_system: Box::new(StandardDosFileSystem::new("./dos".into())),
 		seconds_since_start: 0.,
     };
     event_handler.init_machine(&mut machine);
     let mut step_count = 0;
     loop {
-		if step_count % 1000 == 0 {
-			//println!("interrupt 0x08");
-			machine.interrupt_on_next_step(0x08);
-			event_handler.seconds_since_start += 0.01;
+		//println!("interrupt 0x08");
+		machine.interrupt_on_next_step(0x08);
+		event_handler.seconds_since_start += 54.9451/1000.;
+		event_handler.set_cga_vertial_retrace(true);
+		
+		let num_opcodes_to_exec = 1000;
+		for _ in 0..num_opcodes_to_exec {
+			//println!("before");
+			match machine.step(&mut event_handler) {
+				StepResult::Interrupt(InterruptResult::Wait) => {
+					break;
+				}
+				_ => {}
+			}
+			//println!("after");
+			step_count += 1;
 		}
-		if step_count % 100000 == 0 {
-			event_handler.set_cga_vertial_retrace(true);
-		}
-		//println!("before");
-		machine.step(&mut event_handler);
-		//println!("after");
-		step_count += 1;
 	}
 }

@@ -467,6 +467,7 @@ pub enum Inst {
 
 pub enum InterruptResult {
 	Return,
+	Wait,
 	Stop,
 }
 
@@ -476,4 +477,9 @@ pub trait EventHandler {
 	fn handle_port_input(&mut self, machine: &mut Machine8086, port_index: u16) -> u16;
 	
 	fn handle_port_output(&mut self, machine: &mut Machine8086, port_index: u16, value: u16);
+}
+
+pub enum StepResult {
+	Instruction,
+	Interrupt(InterruptResult),
 }

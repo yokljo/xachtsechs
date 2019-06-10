@@ -1,4 +1,5 @@
-use crate::dos_file_system::DosFileSystem;
+use crate::dos_error_codes::DosErrorCode;
+use crate::dos_file_system::{DosFileAccessMode, DosFileSystem};
 use crate::types::{EventHandler, Flag, InterruptResult, Reg, RegHalf};
 use crate::machine8086::{INTERRUPT_TABLE_ENTRY_BYTES, Machine8086};
 use crate::bios_loader::*;
@@ -101,7 +102,10 @@ impl DosEventHandler {
 			self.port_states.cga_status_register |= 0b1000u16;
 		} else {
 			self.port_states.cga_status_register &= !0b1000u16;
+			// Toggle the first bit.
+			self.port_states.cga_status_register ^= 0b1u16;
 		}
+		dbg!(self.port_states.cga_status_register);
 	}
 
 	fn get_page_origin_address(&self, machine: &Machine8086, video_page: u8) -> u32 {
@@ -126,7 +130,7 @@ impl DosEventHandler {
 				let video_page = if bh == 0xff { machine.get_data_u8(&BIOS_ACTIVE_VIDEO_PAGE) } else { bh };
 				
 				let dh = machine.get_reg_u8(Reg::DX, RegHalf::High);
-				let dl = machine.get_reg_u8(Reg::DX, RegHalf::High);
+				let dl = machine.get_reg_u8(Reg::DX, RegHalf::Low);
 				let cursor_pos_data = ((dh as u16) << 8) + dl as u16;
 				machine.set_data_u16(&BIOS_CURSOR_POSITION[video_page as usize], cursor_pos_data);
 			}
@@ -234,7 +238,7 @@ impl EventHandler for DosEventHandler {
 			0x08 => {
 				// Timer interrupt. This is supposed to be injected by an external source exactly
 				// 18.2 times per second.
-				// TODO
+				// TODO 777497
 				let timer_low = machine.get_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_LOW);
 				let timer_high = machine.get_data_u16(&BIOS_SYSTEM_TIMER_COUNTER_HIGH);
 				let timer = timer_low as u32 + ((timer_high as u32) << 16);
@@ -254,6 +258,22 @@ impl EventHandler for DosEventHandler {
 				// Serial port services
 				let serial_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
 				println!("Serial port interrupt: {}", serial_int);
+			}
+			0x16 => {
+				// Keyboard driver
+				let key_int = machine.get_reg_u8(Reg::AX, RegHalf::High);
+				println!("Keyboard Interrupt: 0x{:x}", key_int);
+				match key_int {
+					0x00 => {
+						// TODO: Wait for keypress and read character.
+					}
+					0x01 => {
+						// TODO: Read key status
+						machine.set_flag(Flag::Zero, false);
+						machine.set_reg_u16(Reg::AX, 0);
+					}
+					_ => panic!("Unknown keyboard interrupt: 0x{:x}", key_int)
+				}
 			}
 			0x1c => {
 				// User timer tick, emitted by 0x08.
@@ -275,6 +295,7 @@ impl EventHandler for DosEventHandler {
 						machine.poke_u16(entry_addr + 2, interrupt_cs);
 					}
 					0x2c => {
+						// TODO 776406
 						// Get system time.
 						let hundredths = ((self.seconds_since_start * 100.) as usize % 100) as u8;
 						let second = (self.seconds_since_start as usize % 60) as u8;
@@ -284,6 +305,7 @@ impl EventHandler for DosEventHandler {
 						machine.set_reg_u8(Reg::CX, RegHalf::Low, minute);
 						machine.set_reg_u8(Reg::DX, RegHalf::High, second);
 						machine.set_reg_u8(Reg::DX, RegHalf::Low, hundredths);
+						return InterruptResult::Wait;
 					}
 					0x33 => {
 						// Modify Ctrl+Break shortcut functionality.
@@ -310,7 +332,7 @@ impl EventHandler for DosEventHandler {
 							}
 							Err(error_code) => {
 								machine.set_flag(Flag::Carry, true);
-								machine.set_reg_u16(Reg::AX, error_code);
+								machine.set_reg_u16(Reg::AX, error_code as u16);
 							}
 						}
 					}
@@ -318,15 +340,50 @@ impl EventHandler for DosEventHandler {
 						// OPEN
 						let filename_addr = machine.get_seg_reg(Reg::DS, Reg::DX);
 						let filename = machine.read_null_terminated_string(filename_addr);
-						let access_modes = machine.get_reg_u8(Reg::AX, RegHalf::Low);
-						match self.file_system.open(filename, access_modes) {
-							Ok(handle) => {
-								machine.set_flag(Flag::Carry, false);
-								machine.set_reg_u16(Reg::AX, handle);
+						let access_mode = match machine.get_reg_u8(Reg::AX, RegHalf::Low) {
+							0 => Some(DosFileAccessMode::ReadOnly),
+							1 => Some(DosFileAccessMode::WriteOnly),
+							2 => Some(DosFileAccessMode::ReadWrite),
+							_ => None,
+						};
+						
+						if let Some(access_mode) = access_mode {
+							match self.file_system.open(filename, access_mode) {
+								Ok(handle) => {
+									machine.set_flag(Flag::Carry, false);
+									machine.set_reg_u16(Reg::AX, handle);
+								}
+								Err(error_code) => {
+									machine.set_flag(Flag::Carry, true);
+									machine.set_reg_u16(Reg::AX, error_code as u16);
+								}
 							}
-							Err(error_code) => {
-								machine.set_flag(Flag::Carry, true);
-								machine.set_reg_u16(Reg::AX, error_code);
+						} else {
+							machine.set_flag(Flag::Carry, true);
+							machine.set_reg_u16(Reg::AX, DosErrorCode::InvalidFileAccessMode as u16);
+						}
+					}
+					0x3f => {
+						// READ
+						let handle = machine.get_reg_u16(Reg::BX);
+						let count = machine.get_reg_u16(Reg::CX) as usize;
+						let destination_addr = machine.get_seg_reg(Reg::DS, Reg::DX) as usize;
+						let rest_of_mem = &mut machine.memory[destination_addr..];
+						
+						if rest_of_mem.len() < count {
+							machine.set_flag(Flag::Carry, true);
+							machine.set_reg_u16(Reg::AX, DosErrorCode::InsufficientMemory as u16);
+						} else {
+							let destination = &mut rest_of_mem[..count];
+							match self.file_system.read(handle, destination) {
+								Ok(read_count) => {
+									machine.set_flag(Flag::Carry, false);
+									machine.set_reg_u16(Reg::AX, read_count);
+								}
+								Err(error_code) => {
+									machine.set_flag(Flag::Carry, true);
+									machine.set_reg_u16(Reg::AX, error_code as u16);
+								}
 							}
 						}
 					}
@@ -365,7 +422,7 @@ impl EventHandler for DosEventHandler {
 	
 	fn handle_port_input(&mut self, machine: &mut Machine8086, port_index: u16) -> u16 {
 		// http://bochs.sourceforge.net/techspec/PORTS.LST
-		match port_index {
+		let value = match port_index {
 			0x61 => {
 				// "Keyboard Controller" control register.
 				// TODO
@@ -373,18 +430,22 @@ impl EventHandler for DosEventHandler {
 			}
 			0x201 => {
 				// TODO: Read joystick values.
-				0
+				0xf0
 			}
 			0x3da => {
+				// TODO: 779086
 				let status = self.port_states.cga_status_register;
 				self.set_cga_vertial_retrace(false);
 				status
 			}
 			_ => panic!("Unhandled input port index: 0x{:02x}", port_index)
-		}
+		};
+		println!("Port in({}): {}", port_index, value);
+		value
 	}
 	
 	fn handle_port_output(&mut self, machine: &mut Machine8086, port_index: u16, value: u16) {
+		println!("Port out({}): {}", port_index, value);
 		match port_index {
 			0x61 => {
 				// TODO
