@@ -401,7 +401,9 @@ pub enum Inst {
 	PopAllGeneralPurposeRegisters,
 	Mov(SourceDestination),
 	Swap(SourceDestination),
-	/// Save as Mov, but increments the Reg by 1 or 2 for 8 and 16 bit SourceDestinations,
+	
+	CmpAndIncrement(SourceDestination, Reg, Option<Reg>),
+	/// Same as Mov, but increments the Reg by 1 or 2 for 8 and 16 bit SourceDestinations,
 	/// respectively. It will do the same to the Option<Reg> if it is also set. If the Direction
 	/// flag is set, it will decrement instead.
 	// TODO: Maybe this should just match the SourceDestination for Addr locations and increment the
@@ -465,14 +467,8 @@ pub enum Inst {
 	//OverrideNextDefaultSegment(Reg)
 }
 
-pub enum InterruptResult {
-	Return,
-	Wait,
-	Stop,
-}
-
 pub trait EventHandler {
-	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8) -> InterruptResult;
+	fn handle_interrupt(&mut self, machine: &mut Machine8086, interrupt_index: u8);
 	
 	fn handle_port_input(&mut self, machine: &mut Machine8086, port_index: u16) -> u16;
 	
@@ -481,5 +477,5 @@ pub trait EventHandler {
 
 pub enum StepResult {
 	Instruction,
-	Interrupt(InterruptResult),
+	Interrupt,
 }

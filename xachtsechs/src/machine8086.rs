@@ -1,4 +1,4 @@
-use crate::types::{Address16, AdjustMode, AnyUnsignedInt8086, ArithmeticMode, DataLocation, DataLocation8, DataLocation16, DisplacementOrigin, EventHandler, Flag, Inst, InterruptResult, JumpCondition, JumpConditionType, ModRmRegMode, OpDirection, OpSize, Reg, REG_COUNT, RegHalf, ScalarMode, ShiftMode, SourceDestination, StepResult, treat_i8_as_u8, treat_u8_as_i8, treat_i16_as_u16, treat_u16_as_i16, treat_i32_as_u32, treat_u32_as_i32, u8_on_bits_are_odd};
+use crate::types::{Address16, AdjustMode, AnyUnsignedInt8086, ArithmeticMode, DataLocation, DataLocation8, DataLocation16, DisplacementOrigin, EventHandler, Flag, Inst, JumpCondition, JumpConditionType, ModRmRegMode, OpDirection, OpSize, Reg, REG_COUNT, RegHalf, ScalarMode, ShiftMode, SourceDestination, StepResult, treat_i8_as_u8, treat_u8_as_i8, treat_i16_as_u16, treat_u16_as_i16, treat_i32_as_u32, treat_u32_as_i32, u8_on_bits_are_odd};
 
 use num::FromPrimitive;
 use std::collections::VecDeque;
@@ -468,10 +468,10 @@ impl Machine8086 {
 	pub fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		if self.number_of_parsed_instructions >= 776390 {
+		/*if self.number_of_parsed_instructions >= 776390 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
-		}
+		}*/
 		self.number_of_parsed_instructions += 1;
 		/*if self.number_of_parsed_instructions > 697516 {//697762 {
 			panic!();
@@ -585,6 +585,15 @@ impl Machine8086 {
 				//println!("0x83 {}, {}", raw_imm, imm);
 				Inst::Arithmetic(arithmetic_mode, SourceDestination::Size16(DataLocation16::Immediate(imm as u16), destination))
 			}
+			// TEST
+			0x84 => {
+				let source_destination = self.read_modrm_source_destination(OpSize::Size8, OpDirection::Destination, ModRmRegMode::Reg);
+				Inst::BitwiseCompareWithAnd(source_destination)
+			}
+			0x84 => {
+				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg);
+				Inst::BitwiseCompareWithAnd(source_destination)
+			}
 			// XCHG - swap register/memory with register
 			0x86 | 0x87 => Inst::Swap(self.read_standard_source_destination(opcode, ModRmRegMode::Reg)),
 			// MOV
@@ -646,6 +655,8 @@ impl Machine8086 {
 			0xa4 => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
 			// MOVSW (the ES segment cannot be overridden)
 			0xa5 => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
+			// CMPSB
+			0xa6 => Inst::CmpAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::SI, Some(Reg::DI)),
 			// TEST
 			0xa8 => {
 				let imm = self.read_ip_u8();
@@ -697,11 +708,11 @@ impl Machine8086 {
 			// LES | LDS (load absolute pointer in the ES/DS segment)
 			0xc4 | 0xc5 => {
 				let source_destination = self.read_modrm_source_destination(OpSize::Size16, OpDirection::Destination, ModRmRegMode::Reg);
-				if let SourceDestination::Size16(DataLocation16::Memory{seg, address16: Address16::DisplacementRel(displacement, offset)}, DataLocation16::Reg(out_reg_l)) = source_destination {
+				if let SourceDestination::Size16(DataLocation16::Memory{seg, address16}, DataLocation16::Reg(out_reg_l)) = source_destination {
 					let out_reg_h = if opcode == 0xc4 { Reg::ES } else { Reg::DS };
-					Inst::Load32{seg, address16: Address16::DisplacementRel(displacement, offset), out_reg_h, out_reg_l}
+					Inst::Load32{seg, address16, out_reg_h, out_reg_l}
 				} else {
-					panic!("Expected source to be Memory/DisplacementRel and destination to be Reg: {:?}", source_destination);
+					panic!("Expected source to be Memory and destination to be Reg: {:?}", source_destination);
 				}
 			}
 			0xc6 => {
@@ -859,6 +870,9 @@ impl Machine8086 {
 				match inst_index {
 					0 => {
 						Inst::Inc(DataLocation::Size16(destination))
+					}
+					1 => {
+						Inst::Dec(DataLocation::Size16(destination))
 					}
 					3 => {
 						if let DataLocation16::Memory{seg, address16} = destination {
@@ -1050,7 +1064,7 @@ impl Machine8086 {
 	}
 	
 	fn interrupt(&mut self, interrupt_index: u8) {
-		println!("Interrupt: {:?}", interrupt_index);
+		//println!("Interrupt: {:?}", interrupt_index);
 		let interrupt_addr = interrupt_index as u32 * INTERRUPT_TABLE_ENTRY_BYTES as u32;
 		let ip = self.peek_u16(interrupt_addr);
 		let cs = self.peek_u16(interrupt_addr + 2);
@@ -1065,7 +1079,7 @@ impl Machine8086 {
 		self.set_flag(Flag::Interrupt, false);
 	}
 	
-	fn return_from_interrupt(&mut self) {
+	pub fn return_from_interrupt(&mut self) {
 		let ip = self.pop_u16();
 		let cs = self.pop_u16();
 		let old_flags = self.pop_u16();
@@ -1152,6 +1166,30 @@ impl Machine8086 {
 				let value_right = self.get_data_u16(&right);
 				self.set_data_u16(&left, value_right);
 				self.set_data_u16(&right, value_left);
+			}
+			Inst::CmpAndIncrement(SourceDestination::Size8(ref source, ref destination), inc_reg, inc_reg2) => {
+				let value1 = self.get_data_u8(&source);
+				let value2 = self.get_data_u8(&destination);
+				self.apply_arithmetic_inst(value1, value2, ArithmeticMode::Cmp, true);
+				if self.get_flag(Flag::Direction) {
+					self.sub_from_reg(inc_reg, 1);
+					if let Some(inc_reg2) = inc_reg2 { self.sub_from_reg(inc_reg2, 1); }
+				} else {
+					self.add_to_reg(inc_reg, 1);
+					if let Some(inc_reg2) = inc_reg2 { self.add_to_reg(inc_reg2, 1); }
+				}
+			}
+			Inst::CmpAndIncrement(SourceDestination::Size16(ref source, ref destination), inc_reg, inc_reg2) => {
+				let value1 = self.get_data_u16(&source);
+				let value2 = self.get_data_u16(&destination);
+				self.apply_arithmetic_inst(value1, value2, ArithmeticMode::Cmp, true);
+				if self.get_flag(Flag::Direction) {
+					self.sub_from_reg(inc_reg, 2);
+					if let Some(inc_reg2) = inc_reg2 { self.sub_from_reg(inc_reg2, 2); }
+				} else {
+					self.add_to_reg(inc_reg, 2);
+					if let Some(inc_reg2) = inc_reg2 { self.add_to_reg(inc_reg2, 2); }
+				}
 			}
 			Inst::MovAndIncrement(SourceDestination::Size8(ref source, ref destination), inc_reg, inc_reg2) => {
 				let value = self.get_data_u8(&source);
@@ -1613,26 +1651,11 @@ impl Machine8086 {
 		if (ip & 0xff00) == 0x1100 && cs == 0xf000 {
 			self.set_flag(Flag::Interrupt, true);
 			let interrupt_index = (ip & 0xff) as u8;
-			let interrupt_result = event_handler.handle_interrupt(self, interrupt_index);
-			match interrupt_result {
-				InterruptResult::Return => {
-					self.return_from_interrupt();
-				}
-				InterruptResult::Wait => {
-					self.return_from_interrupt();
-				}
-				InterruptResult::Stop => {
-					panic!();
-				}
-			}
+			event_handler.handle_interrupt(self, interrupt_index);
 			
-			StepResult::Interrupt(interrupt_result)
+			StepResult::Interrupt
 		} else {
 			let inst = self.parse_instruction();
-			if self.number_of_parsed_instructions > 797780 {
-				println!("MEM: {:?}", &self.memory[0xb8000..0xb8000+0x1000]);
-				panic!();
-			}
 			//println!("{:?}", inst);
 			self.apply_instruction(&inst, event_handler);
 			
