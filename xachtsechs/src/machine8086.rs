@@ -14,7 +14,7 @@ pub struct Machine8086 {
 	pub pending_interrupts: VecDeque<u8>,
 	
 	override_default_segment: Option<Reg>,
-	number_of_parsed_instructions: usize,
+	pub number_of_parsed_instructions: usize,
 }
 
 impl Machine8086 {
@@ -468,7 +468,7 @@ impl Machine8086 {
 	pub fn parse_instruction(&mut self) -> Inst {
 		let opcode = self.read_ip_u8();
 		
-		/*if self.number_of_parsed_instructions >= 776390 {
+		/*if self.number_of_parsed_instructions >= 2182140 {
 			println!("{:?}", self.registers);
 			println!("Opcode: 0x{:02x} ({:?})", opcode, self.number_of_parsed_instructions);
 		}*/
@@ -674,6 +674,8 @@ impl Machine8086 {
 			0xac => Inst::MovAndIncrement(SourceDestination::Size8(DataLocation8::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation8::Reg(Reg::AX, RegHalf::Low)), Reg::SI, None),
 			// LODSW
 			0xad => Inst::MovAndIncrement(SourceDestination::Size16(DataLocation16::Memory{seg: self.resolve_default_segment(Reg::DS), address16: Address16::Reg(Reg::SI)}, DataLocation16::Reg(Reg::AX)), Reg::SI, None),
+			// SCASB
+			0xae => Inst::CmpAndIncrement(SourceDestination::Size8(DataLocation8::Reg(Reg::AX, RegHalf::Low), DataLocation8::Memory{seg: Reg::ES, address16: Address16::Reg(Reg::DI)}), Reg::DI, None),
 			0xb0 ... 0xb7 => {
 				let (reg, reg_half) = Reg::reg8((opcode & 0b111) as usize).unwrap();
 				let imm = self.read_ip_u8();
@@ -817,8 +819,10 @@ impl Machine8086 {
 				// the next instruction's execution.
  				Inst::NoOp
 			}
+			// REPNZ
+			0xf2 => Inst::RepeatNextRegTimes{reg: Reg::CX, until_zero_flag: Some(true)},
 			// REPZ
-			0xf3 => Inst::RepeatNextRegTimes{reg: Reg::CX, until_zero_flag: Some(true)},
+			0xf3 => Inst::RepeatNextRegTimes{reg: Reg::CX, until_zero_flag: Some(false)},
 			0xf4 => Inst::Halt,
 			// CMC (compliment (flip the state of the) carry flag)
 			0xf5 => Inst::InvertFlag(Flag::Carry),
@@ -1097,6 +1101,10 @@ impl Machine8086 {
 	}
 	
 	pub fn apply_instruction(&mut self, inst: &Inst, event_handler: &mut EventHandler) {
+		/*if self.number_of_parsed_instructions >= 2182140 {
+			println!("{:?}", inst);
+		}*/
+	
 		match *inst {
 			Inst::NoOp => {}
 			Inst::Push16(ref location) => {
@@ -1476,13 +1484,18 @@ impl Machine8086 {
 				let repeat_inst = self.parse_instruction();
 				
 				let consider_zero_flag = match repeat_inst {
-					// TODO: Add the CMPS and SCAS instructions when they are implemented.
+					// CmpAndIncrement is used by only CMPS and SCAS.
+					Inst::CmpAndIncrement{..} => true,
 					_ => false,
 				};
 				
 				//dbg!(self.get_reg_u16(reg));
 				while self.get_reg_u16(reg) != 0 {
-					// TODO: Service pending interrupts
+					if !self.pending_interrupts.is_empty() {
+						// TODO: Service pending interrupts
+						panic!();
+					}
+					
 					self.apply_instruction(&repeat_inst, event_handler);
 					self.sub_from_reg(reg, 1);
 					//dbg!(self.get_reg_u16(reg));
@@ -1656,7 +1669,6 @@ impl Machine8086 {
 			StepResult::Interrupt
 		} else {
 			let inst = self.parse_instruction();
-			//println!("{:?}", inst);
 			self.apply_instruction(&inst, event_handler);
 			
 			StepResult::Instruction
