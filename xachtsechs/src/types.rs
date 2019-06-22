@@ -390,6 +390,17 @@ impl SourceDestination {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StringInst {
+	CmpAndIncrement(SourceDestination, Reg, Option<Reg>),
+	/// Same as Mov, but increments the Reg by 1 or 2 for 8 and 16 bit SourceDestinations,
+	/// respectively. It will do the same to the Option<Reg> if it is also set. If the Direction
+	/// flag is set, it will decrement instead.
+	// TODO: Maybe this should just match the SourceDestination for Addr locations and increment the
+	// associated registers?
+	MovAndIncrement(SourceDestination, Reg, Option<Reg>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Inst {
 	NoOp,
 	Push16(DataLocation16),
@@ -402,13 +413,8 @@ pub enum Inst {
 	Mov(SourceDestination),
 	Swap(SourceDestination),
 	
-	CmpAndIncrement(SourceDestination, Reg, Option<Reg>),
-	/// Same as Mov, but increments the Reg by 1 or 2 for 8 and 16 bit SourceDestinations,
-	/// respectively. It will do the same to the Option<Reg> if it is also set. If the Direction
-	/// flag is set, it will decrement instead.
-	// TODO: Maybe this should just match the SourceDestination for Addr locations and increment the
-	// associated registers?
-	MovAndIncrement(SourceDestination, Reg, Option<Reg>),
+	StringInst(StringInst),
+	
 	MovReg32{source_h: Reg, source_l: Reg, dest_h: Reg, dest_l: Reg},
 	
 	Load32{seg: Reg, address16: Address16, out_reg_h: Reg, out_reg_l: Reg},
@@ -436,7 +442,7 @@ pub enum Inst {
 	//IncBy16(DataLocation16, u16),
 	SetFlag(Flag, bool),
 	InvertFlag(Flag),
-	RepeatNextRegTimes{reg: Reg, until_zero_flag: Option<bool>},
+	RepeatRegTimes{reg: Reg, until_zero_flag: Option<bool>, repeat_inst: StringInst},
 	Call(i32),
 	// After popping the IP from the stack, it will pop extra_pop more bytes from the stack. These
 	// would probably be arguments that were pushed to the stack just before calling the function in
